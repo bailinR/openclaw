@@ -292,7 +292,7 @@ function renderPage() {
     .layout {
       height: calc(100vh - 56px);
       display: grid;
-      grid-template-columns: minmax(260px, 340px) minmax(360px, 1fr) minmax(300px, 420px);
+      grid-template-columns: minmax(280px, 360px) minmax(420px, 1fr) minmax(380px, 520px);
       min-height: 520px;
     }
     aside, main, section {
@@ -386,7 +386,7 @@ function renderPage() {
     .conversation {
       flex: 1;
       overflow: auto;
-      padding: 18px;
+      padding: 18px 24px;
     }
     .message {
       max-width: 78%;
@@ -417,25 +417,111 @@ function renderPage() {
     }
     .detail-body {
       overflow: auto;
-      padding: 16px;
+      padding: 14px;
     }
-    .fields {
-      display: grid;
+    .detail-section {
+      border: 1px solid #e4e9f1;
+      border-radius: 8px;
+      background: #ffffff;
+      margin-bottom: 12px;
+      overflow: hidden;
+    }
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
       gap: 10px;
-    }
-    .field {
+      padding: 10px 12px;
       border-bottom: 1px solid #edf0f4;
-      padding-bottom: 8px;
+      font-size: 14px;
+      font-weight: 650;
+      background: #f8fafc;
     }
-    .field-key {
+    .section-body {
+      padding: 10px 12px;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .summary-card {
+      min-height: 68px;
+      border: 1px solid #e4e9f1;
+      border-radius: 8px;
+      padding: 9px 10px;
+      background: #fbfcfe;
+    }
+    .summary-label {
       color: var(--muted);
       font-size: 12px;
-      margin-bottom: 3px;
+      margin-bottom: 4px;
     }
-    .field-value {
+    .summary-value {
+      font-size: 16px;
+      font-weight: 650;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .kv-grid {
+      display: grid;
+      grid-template-columns: 112px minmax(0, 1fr);
+      column-gap: 10px;
+    }
+    .kv-row {
+      display: contents;
+    }
+    .kv-key, .kv-value {
+      border-bottom: 1px solid #edf0f4;
+      padding: 8px 0;
+    }
+    .kv-key {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .kv-value {
       white-space: pre-wrap;
       word-break: break-word;
       line-height: 1.5;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .chip {
+      display: inline-flex;
+      max-width: 100%;
+      border-radius: 999px;
+      padding: 4px 8px;
+      background: var(--accent-soft);
+      color: #0f5f59;
+      font-size: 12px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .note-list {
+      margin: 0;
+      padding-left: 18px;
+      line-height: 1.55;
+    }
+    .note-list li {
+      margin: 4px 0;
+      word-break: break-word;
+    }
+    .assessment-summary {
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .score-pill {
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: #fff7ed;
+      color: #9a3412;
+      font-size: 12px;
+      white-space: nowrap;
     }
     .empty {
       margin: 24px;
@@ -466,6 +552,7 @@ function renderPage() {
       }
       main { min-height: 520px; }
       .message { max-width: 92%; }
+      .summary-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -611,12 +698,170 @@ function renderPage() {
 
     function renderAssessment(assessment) {
       if (!assessment || typeof assessment !== "object") return '<div class="empty">暂无沉淀信息。</div>';
-      const entries = Object.entries(assessment).filter(([key]) => !key.startsWith("_"));
-      if (!entries.length) return '<div class="empty">暂无沉淀信息。</div>';
-      return '<div class="fields">' + entries.map(([key, value]) =>
-        '<div class="field"><div class="field-key">' + escapeHtml(labelForKey(key)) + '</div>' +
-        '<div class="field-value">' + escapeHtml(formatValue(value)) + '</div></div>'
-      ).join("") + '</div>';
+      const sections = [
+        renderSummarySection(assessment),
+        renderKnownInfoSection(assessment.known_info || assessment.knownInfo),
+        renderAssessmentSection(assessment.assessment),
+        renderListSection("候选人问题", assessment.candidate_questions || assessment.candidateQuestions),
+        renderListSection("后续待补充", assessment.next_missing_info || assessment.nextMissingInfo),
+        renderOtherSection(assessment),
+      ].filter(Boolean);
+      return sections.join("") || '<div class="empty">暂无沉淀信息。</div>';
+    }
+
+    function renderSummarySection(assessment) {
+      const score = assessment.assessment && typeof assessment.assessment === "object"
+        ? assessment.assessment.score
+        : "";
+      const level = assessment.assessment && typeof assessment.assessment === "object"
+        ? assessment.assessment.level
+        : "";
+      const cards = [
+        ["姓名", assessment.name || assessment.candidateName || assessment.realName],
+        ["岗位", assessment.position || assessment.role],
+        ["阶段", assessment.stage || assessment.status],
+        ["评分", [score, level].filter(hasUsefulValue).join(" / ")],
+      ];
+      return '<div class="detail-section"><div class="section-title">核心概览</div>' +
+        '<div class="section-body"><div class="summary-grid">' +
+        cards.map(([label, value]) =>
+          '<div class="summary-card"><div class="summary-label">' + escapeHtml(label) + '</div>' +
+          '<div class="summary-value">' + escapeHtml(formatCompactValue(value)) + '</div></div>'
+        ).join("") +
+        '</div></div></div>';
+    }
+
+    function renderKnownInfoSection(knownInfo) {
+      if (!knownInfo || typeof knownInfo !== "object") return "";
+      const entries = orderedEntries(knownInfo, [
+        "work_status",
+        "education",
+        "years_experience",
+        "project_planning_experience",
+        "representative_project",
+        "planning_outputs",
+        "tools",
+        "collaboration",
+        "sales_performance",
+        "customer_type",
+        "decision_level",
+        "sales_cycle",
+        "acquisition_channels",
+        "salary_expectation",
+      ]).filter(([, value]) => hasUsefulValue(value));
+      if (!entries.length) return "";
+      return renderKeyValueSection("已知信息", entries);
+    }
+
+    function renderAssessmentSection(assessment) {
+      if (!assessment || typeof assessment !== "object") return "";
+      const summary = assessment.summary ? '<div class="assessment-summary">' + escapeHtml(formatValue(assessment.summary)) + '</div>' : "";
+      const score = [assessment.score, assessment.level].filter(hasUsefulValue).join(" / ");
+      const titleExtra = score ? '<span class="score-pill">' + escapeHtml(score) + '</span>' : "";
+      const plus = renderPoints("加分项", assessment.plus);
+      const minus = renderPoints("减分项", assessment.minus);
+      return '<div class="detail-section"><div class="section-title"><span>内部评估</span>' + titleExtra + '</div>' +
+        '<div class="section-body">' + (summary || '<div class="muted">暂无简评</div>') + plus + minus + '</div></div>';
+    }
+
+    function renderPoints(title, items) {
+      if (!Array.isArray(items) || items.length === 0) return "";
+      const rendered = items
+        .map((item) => {
+          if (!item || typeof item !== "object") return formatValue(item);
+          const points = hasUsefulValue(item.points) ? "（" + formatValue(item.points) + "分）" : "";
+          const evidence = item.evidence ? "：" + formatValue(item.evidence) : "";
+          return formatCompactValue(item.item || item.name || title) + points + evidence;
+        })
+        .filter(Boolean);
+      if (!rendered.length) return "";
+      return '<div style="margin-top:10px;"><div class="field-key">' + escapeHtml(title) + '</div>' +
+        '<ul class="note-list">' + rendered.map((item) => '<li>' + escapeHtml(item) + '</li>').join("") + '</ul></div>';
+    }
+
+    function renderListSection(title, value) {
+      const values = arrayValues(value);
+      if (!values.length) return "";
+      return '<div class="detail-section"><div class="section-title">' + escapeHtml(title) + '</div>' +
+        '<div class="section-body"><ul class="note-list">' +
+        values.map((item) => '<li>' + escapeHtml(formatValue(item)) + '</li>').join("") +
+        '</ul></div></div>';
+    }
+
+    function renderOtherSection(assessment) {
+      const hidden = new Set([
+        "name",
+        "candidateName",
+        "realName",
+        "position",
+        "role",
+        "stage",
+        "status",
+        "known_info",
+        "knownInfo",
+        "assessment",
+        "candidate_questions",
+        "candidateQuestions",
+        "next_missing_info",
+        "nextMissingInfo",
+      ]);
+      const entries = Object.entries(assessment)
+        .filter(([key, value]) => !key.startsWith("_") && !hidden.has(key) && hasUsefulValue(value));
+      if (!entries.length) return "";
+      return renderKeyValueSection("其他记录", entries);
+    }
+
+    function renderKeyValueSection(title, entries) {
+      return '<div class="detail-section"><div class="section-title">' + escapeHtml(title) + '</div>' +
+        '<div class="section-body"><div class="kv-grid">' +
+        entries.map(([key, value]) =>
+          '<div class="kv-row"><div class="kv-key">' + escapeHtml(labelForKey(key)) + '</div>' +
+          '<div class="kv-value">' + renderValue(value) + '</div></div>'
+        ).join("") +
+        '</div></div></div>';
+    }
+
+    function renderValue(value) {
+      if (Array.isArray(value)) {
+        const values = arrayValues(value);
+        if (!values.length) return '<span class="muted">未填写</span>';
+        return '<div class="chips">' + values.map((item) => '<span class="chip">' + escapeHtml(formatValue(item)) + '</span>').join("") + '</div>';
+      }
+      if (value && typeof value === "object") {
+        const entries = Object.entries(value).filter(([, nestedValue]) => hasUsefulValue(nestedValue));
+        if (!entries.length) return '<span class="muted">未填写</span>';
+        return entries.map(([key, nestedValue]) =>
+          '<div><span class="muted">' + escapeHtml(labelForKey(key)) + '：</span>' + escapeHtml(formatValue(nestedValue)) + '</div>'
+        ).join("");
+      }
+      return escapeHtml(formatValue(value));
+    }
+
+    function orderedEntries(record, preferredKeys) {
+      const used = new Set();
+      const ordered = [];
+      for (const key of preferredKeys) {
+        if (Object.prototype.hasOwnProperty.call(record, key)) {
+          ordered.push([key, record[key]]);
+          used.add(key);
+        }
+      }
+      for (const entry of Object.entries(record)) {
+        if (!used.has(entry[0])) ordered.push(entry);
+      }
+      return ordered;
+    }
+
+    function arrayValues(value) {
+      if (!Array.isArray(value)) return hasUsefulValue(value) ? [value] : [];
+      return value.filter(hasUsefulValue);
+    }
+
+    function hasUsefulValue(value) {
+      if (value == null || value === "") return false;
+      if (Array.isArray(value)) return value.some(hasUsefulValue);
+      if (typeof value === "object") return Object.values(value).some(hasUsefulValue);
+      return true;
     }
 
     function labelForKey(key) {
@@ -635,12 +880,29 @@ function renderPage() {
         experience: "经验",
         salary: "期望薪资",
         expectedSalary: "期望薪资",
+        salary_expectation: "薪资期望",
         skills: "技能",
         summary: "摘要",
         assessment: "评估",
         nextStep: "下一步",
         updatedAt: "更新时间",
         createdAt: "创建时间",
+        safeId: "内部 ID",
+        lastCandidateMessage: "最近求职者消息",
+        lastReply: "最近回复",
+        work_status: "当前状态",
+        education: "学历专业",
+        years_experience: "工作年限",
+        project_planning_experience: "策划经验",
+        representative_project: "代表项目",
+        planning_outputs: "策划输出",
+        tools: "常用工具",
+        collaboration: "协作沟通",
+        sales_performance: "销售业绩",
+        customer_type: "客户类型",
+        decision_level: "对接层级",
+        sales_cycle: "成交周期",
+        acquisition_channels: "获客方式",
       };
       return labels[key] || key;
     }
@@ -648,8 +910,18 @@ function renderPage() {
     function formatValue(value) {
       if (value == null || value === "") return "未填写";
       if (Array.isArray(value)) return value.map(formatValue).join("、");
-      if (typeof value === "object") return JSON.stringify(value, null, 2);
+      if (typeof value === "object") {
+        return Object.entries(value)
+          .filter(([, nestedValue]) => hasUsefulValue(nestedValue))
+          .map(([key, nestedValue]) => labelForKey(key) + "：" + formatValue(nestedValue))
+          .join("；") || "未填写";
+      }
       return String(value);
+    }
+
+    function formatCompactValue(value) {
+      const formatted = formatValue(value);
+      return formatted === "未填写" ? "-" : formatted;
     }
 
     function formatTime(value) {
