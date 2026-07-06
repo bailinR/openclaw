@@ -13,10 +13,18 @@ const rootDir = process.cwd();
 const stateDir = path.join(os.homedir(), ".openclaw-wecom-kf");
 const statePath = path.join(stateDir, "state.json");
 const logPath = path.join(stateDir, "bridge.log");
+const candidateAssessmentPath =
+  process.env.WECOM_KF_CANDIDATE_ASSESSMENT_PATH ||
+  path.join(stateDir, "candidate-assessments.json");
+const projectPlanningTestPdfPath =
+  process.env.WECOM_KF_PROJECT_PLANNING_TEST_PDF_PATH ||
+  path.join(stateDir, "assets", "项目策划岗位试岗测试题.pdf");
 const port = Number(process.env.WECOM_KF_BRIDGE_PORT || 19088);
 const callbackPath = process.env.WECOM_KF_CALLBACK_PATH || "/wecom-kf";
 const agentId = process.env.OPENCLAW_JOBTEST_AGENT_ID || "job-agent";
-const intakeDelayMs = 500;
+const intakeDelayMs = Number(process.env.WECOM_KF_INTAKE_DELAY_MS || 500);
+const replyPartDelayMs = Number(process.env.WECOM_KF_REPLY_PART_DELAY_MS || 2500);
+const preSendRecheckMax = Number(process.env.WECOM_KF_PRE_SEND_RECHECK_MAX || 3);
 
 const config = {
   corpId: need("WECOM_KF_CORP_ID"),
@@ -27,6 +35,8 @@ const config = {
 };
 
 fs.mkdirSync(stateDir, { recursive: true });
+fs.mkdirSync(path.dirname(candidateAssessmentPath), { recursive: true });
+fs.mkdirSync(path.dirname(projectPlanningTestPdfPath), { recursive: true });
 const state = loadState();
 let accessTokenCache = null;
 let processing = Promise.resolve();
@@ -42,6 +52,11 @@ const server = http.createServer((req, res) => {
 server.listen(port, "127.0.0.1", () => {
   log(`[wecom-kf] listening on http://127.0.0.1:${port}${callbackPath}`);
   log(`[wecom-kf] log file: ${logPath}`);
+  log(`[wecom-kf] candidate assessment file: ${candidateAssessmentPath}`);
+  log(`[wecom-kf] project planning test PDF: ${projectPlanningTestPdfPath}`);
+  log(
+    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMs}ms; pre-send recheck max: ${preSendRecheckMax}`,
+  );
 });
 
 async function handleRequest(req, res) {
@@ -141,7 +156,7 @@ async function processCallback(xml) {
   }
 
   for (const batch of batches.values()) {
-    await processBatch(batch);
+    await processBatch(batch, { token });
   }
 
   saveState();
@@ -171,46 +186,95 @@ function normalizeMessage(message) {
   return { msgId, text, externalUserId, openKfid };
 }
 
-async function processBatch(batch) {
-  const ids = batch.items.map((i) => i.msgId);
-  const text =
-    batch.items.length === 1
-      ? batch.items[0].text
-      : [
-          "候选人连续发来了多条消息，请合并理解后一次性回复：",
-          "",
-          ...batch.items.map((i, n) => `${n + 1}. ${i.text}`),
-        ].join("\n");
+async function processBatch(batch, { token }) {
+  const items = [...batch.items];
+  let text = buildBatchText(items);
 
-  log(`[wecom-kf] candidate batch ${batch.externalUserId}: ${batch.items.length} message(s)`);
+  log(`[wecom-kf] candidate batch ${batch.externalUserId}: ${items.length} message(s)`);
 
-  let reply = "";
+  let agentResult = { reply: "", actions: {}, candidateUpdate: null };
   try {
-    reply = await runOpenClaw({ externalUserId: batch.externalUserId, text });
+    agentResult = await runOpenClaw({ externalUserId: batch.externalUserId, text });
+
+    for (let attempt = 0; attempt < preSendRecheckMax; attempt += 1) {
+      let newerItems = [];
+      try {
+        newerItems = await fetchNewItemsBeforeSend({
+          token,
+          openKfid: batch.openKfid,
+          externalUserId: batch.externalUserId,
+          knownIds: new Set(items.map((item) => item.msgId)),
+        });
+      } catch (err) {
+        log(`[wecom-kf] pre-send recheck failed; sending current reply: ${err.message || err}`);
+        break;
+      }
+
+      if (newerItems.length === 0) break;
+
+      items.push(...newerItems);
+      text = buildBatchText(items, { beforeSendRegeneration: true });
+      log(
+        `[wecom-kf] found ${newerItems.length} newer message(s) before send; regenerating reply for ${batch.externalUserId}`,
+      );
+      agentResult = await runOpenClaw({ externalUserId: batch.externalUserId, text });
+    }
   } catch (err) {
-    ids.forEach(remember);
+    items.forEach((item) => remember(item.msgId));
     log(`[wecom-kf] OpenClaw failed: ${err.message || err}`);
     return;
   }
 
-  if (!reply || /^NO_REPLY$/i.test(reply)) {
-    ids.forEach(remember);
-    return;
+  const reply = agentResult.reply || "";
+  const actions = agentResult.actions || {};
+  let sentReply = false;
+
+  if (reply && !/^NO_REPLY$/i.test(reply)) {
+    const outboundTexts = splitOutboundReply(reply, {
+      reserveSlots: actions.sendProjectPlanningTestPdf ? 1 : 0,
+    });
+    try {
+      for (let i = 0; i < outboundTexts.length; i += 1) {
+        if (i > 0) await sleep(replyPartDelayMs);
+        await sendText({
+          openKfid: batch.openKfid,
+          externalUserId: batch.externalUserId,
+          text: outboundTexts[i],
+        });
+      }
+      sentReply = true;
+      log(`[wecom-kf] replied to ${batch.externalUserId} (${outboundTexts.length} text part(s))`);
+    } catch (err) {
+      log(`[wecom-kf] send failed: ${err.message || err}`);
+    }
   }
 
-  try {
-    await sendText({ openKfid: batch.openKfid, externalUserId: batch.externalUserId, text: reply });
-    log(`[wecom-kf] replied to ${batch.externalUserId}`);
-  } catch (err) {
-    log(`[wecom-kf] send failed: ${err.message || err}`);
+  if (actions.sendProjectPlanningTestPdf) {
+    try {
+      await sendProjectPlanningTestPdf({
+        openKfid: batch.openKfid,
+        externalUserId: batch.externalUserId,
+      });
+      log(`[wecom-kf] sent project planning test PDF to ${batch.externalUserId}`);
+    } catch (err) {
+      log(`[wecom-kf] project planning test PDF send failed: ${err.message || err}`);
+    }
   }
 
-  ids.forEach(remember);
+  saveFinalConversationAndAssessment({
+    externalUserId: batch.externalUserId,
+    text,
+    reply: sentReply ? reply : "",
+    candidateUpdate: agentResult.candidateUpdate,
+  });
+
+  items.forEach((item) => remember(item.msgId));
 }
 
 async function runOpenClaw({ externalUserId, text }) {
   const safeExternalUserId = safeId(externalUserId);
   const historyPath = path.join(stateDir, `history-${safeExternalUserId}.json`);
+  const candidateRecord = loadCandidateRecord(safeExternalUserId);
 
   let history = [];
   try {
@@ -230,22 +294,75 @@ async function runOpenClaw({ externalUserId, text }) {
     `message-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.txt`,
   );
   const prompt = [
-    "来自微信客服候选人的新消息。",
-    `候选人ID：${externalUserId}`,
+    "你是企业微信招聘客服 bridge 的内部响应生成器。",
+    "必须只输出一个合法 JSON 对象，不要使用 Markdown 代码块，不要输出 JSON 以外的文字。",
+    "bridge 只会把 reply 字段发给求职者，candidate_update 字段只写入内部候选人资料评分文件。",
+    "reply 字段只能放候选人可见的微信正文，不得包含 JSON、candidate_update、assessment、score、评分、加分、减分、总分、等级等内部字段或明细。",
+    "",
+    "JSON 输出格式：",
+    JSON.stringify(
+      {
+        reply: "要发给候选人的微信正文；如果不需要回复，填 NO_REPLY",
+        candidate_update: {
+          name: "候选人姓名，未知填 null",
+          position: "应聘岗位，未知填 null",
+          stage: "当前流程阶段，例如 初始沟通/销售初筛/测试题已发/待负责人确认",
+          known_info: {
+            work_status: "在职/离职/未知",
+            education: "学历专业，未知填 null",
+            years_experience: "工作年限，未知填 null",
+            project_planning_experience: "项目策划相关经历，未知填 null",
+            representative_project: "代表项目或策划案例，未知填 null",
+            planning_outputs: "方案、活动、商业计划、项目书等输出物经验，未知填 null",
+            tools: "常用工具，未知填 null",
+            collaboration: "跨部门沟通、客户沟通或执行协调经验，未知填 null",
+            sales_performance: "销售业绩，未知填 null",
+            customer_type: "客户类型，未知填 null",
+            decision_level: "对接层级，未知填 null",
+            sales_cycle: "成交周期，未知填 null",
+            acquisition_channels: "获客方式，未知填 null",
+            salary_expectation: "薪资期望或薪酬结构，未知填 null",
+          },
+          candidate_questions: ["候选人问过、需要面试官解答的问题"],
+          next_missing_info: ["后续还需要补充了解的信息"],
+          assessment: {
+            score: "0-100 的数字；信息不足时也要基于已知信息给暂定分",
+            level: "信息不足/需谨慎/基本匹配/较匹配/优秀",
+            plus: [{ item: "加分项", points: 0, evidence: "依据" }],
+            minus: [{ item: "减分项", points: 0, evidence: "依据" }],
+            summary: "给招聘负责人看的内部简评，不要写给候选人",
+          },
+        },
+        actions: {
+          send_project_planning_test_pdf:
+            "是否发送项目策划测试题 PDF，布尔值。只有项目策划候选人完成基础信息收集、准备正式发题时才填 true",
+        },
+      },
+      null,
+      2,
+    ),
+    "",
+    "已积累候选人资料评分：",
+    JSON.stringify(candidateRecord || {}, null, 2),
     "",
     "最近对话记录：",
     recentHistory || "暂无",
     "",
-    "本次新消息：",
-    text,
-    "",
     "回复要求：",
     "1. 先根据最近对话判断已知信息，不要重复询问已经知道的姓名、岗位、是否方便沟通等内容。",
     "2. 按不同求职者分别积累信息，并基于已知信息继续追问。",
+    "2.1 候选人可能把姓名、岗位、当前状态拆成连续几条短消息发送；如果本次新消息、最近对话或已积累资料里已经出现姓名或岗位，不要再重复问。",
     "3. 每次只问一个核心问题，微信纯文本回复，不要使用 Markdown 样式符号。",
+    "3.1 如果 reply 里有两段且表达的是两层不同意思，中间用一个空行分隔，bridge 会分成两条微信消息发送。",
+    "3.2 不要写“他/她”“他（她）”“她/他”这种不自然的不确定式称呼；需要泛指负责人或面试官时，用“他”或直接写“负责人”。",
     "4. 收集到的信息不需要发给求职者汇总确认。",
     "5. 不要发送系统报错、日志、调试信息或内部失败原因。",
-    "6. 只输出要发给候选人的正文；如果不需要回复，只输出 NO_REPLY。",
+    "6. 候选人资料、评分、加减分明细是内部信息，只能放在 candidate_update，绝不能写进 reply。",
+    "7. candidate_update 必须基于已知信息持续更新；不知道的字段填 null 或空数组，不要编造。",
+    "8. 如果需要发送项目策划测试题 PDF，只能通过 actions.send_project_planning_test_pdf=true 触发；reply 里不要写服务器文件路径或内部动作名。",
+    "",
+    "本次新消息：",
+    text,
   ].join("\n");
 
   fs.writeFileSync(messagePath, prompt, "utf8");
@@ -270,6 +387,8 @@ async function runOpenClaw({ externalUserId, text }) {
   log(`[wecom-kf] running OpenClaw agent=${agentId} session=${sessionKey}`);
 
   let reply = "";
+  let candidateUpdate = null;
+  let actions = {};
   try {
     const output = await execFile(process.execPath, args, {
       cwd: rootDir,
@@ -291,17 +410,75 @@ async function runOpenClaw({ externalUserId, text }) {
           .trim()
       : "";
 
-    reply = (
+    const rawReply = (
       payloadText ||
       result.finalAssistantVisibleText ||
       result.finalAssistantRawText ||
       result.text ||
       ""
     ).trim();
+    const parsed = parseAgentJsonReply(rawReply);
+    reply = parsed.reply;
+    candidateUpdate = parsed.candidateUpdate;
+    actions = parsed.actions;
   } finally {
     try {
       fs.unlinkSync(messagePath);
     } catch {}
+  }
+
+  if (!reply || /^NO_REPLY$/i.test(reply)) {
+    return { reply: "", actions, candidateUpdate };
+  }
+
+  return { reply, actions, candidateUpdate };
+}
+
+function buildBatchText(items, { beforeSendRegeneration = false } = {}) {
+  const prefix = beforeSendRegeneration
+    ? [
+        "发送前发现候选人又补充了新消息。上一版回复还没有发出，请忽略未发送的旧回复，结合下面全部消息重新生成一次最终回复：",
+        "",
+      ]
+    : [];
+
+  return items.length === 1 && !beforeSendRegeneration
+    ? items[0].text
+    : [
+        ...prefix,
+        "候选人连续发来了多条消息，请合并理解后一次性回复：",
+        "",
+        ...items.map((item, index) => `${index + 1}. ${item.text}`),
+      ].join("\n");
+}
+
+async function fetchNewItemsBeforeSend({ token, openKfid, externalUserId, knownIds }) {
+  const result = await syncMessages({ token, openKfid });
+  const messages = Array.isArray(result.msg_list) ? result.msg_list : [];
+  const newerItems = messages
+    .map(normalizeMessage)
+    .filter(Boolean)
+    .filter((item) => !state.processedMsgIds.includes(item.msgId))
+    .filter((item) => !knownIds.has(item.msgId))
+    .filter((item) => item.openKfid === openKfid && item.externalUserId === externalUserId);
+
+  if (newerItems.length > 0) {
+    log(`[wecom-kf] pre-send sync_msg found ${newerItems.length} newer candidate message(s)`);
+  }
+
+  return newerItems;
+}
+
+function saveFinalConversationAndAssessment({ externalUserId, text, reply, candidateUpdate }) {
+  const safeExternalUserId = safeId(externalUserId);
+  const historyPath = path.join(stateDir, `history-${safeExternalUserId}.json`);
+
+  let history = [];
+  try {
+    const loaded = JSON.parse(fs.readFileSync(historyPath, "utf8"));
+    if (Array.isArray(loaded)) history = loaded;
+  } catch {
+    history = [];
   }
 
   history.push({ role: "候选人", text, at: new Date().toISOString() });
@@ -312,11 +489,227 @@ async function runOpenClaw({ externalUserId, text }) {
 
   fs.writeFileSync(historyPath, JSON.stringify(history.slice(-60), null, 2), "utf8");
 
-  if (!reply || /^NO_REPLY$/i.test(reply)) {
-    return "";
+  if (candidateUpdate) {
+    saveCandidateRecord({
+      safeExternalUserId,
+      externalUserId,
+      update: candidateUpdate,
+      lastCandidateMessage: text,
+      lastReply: reply || "",
+    });
+  }
+}
+
+function parseAgentJsonReply(rawText) {
+  const raw = String(rawText || "").trim();
+  if (!raw) return { reply: "", candidateUpdate: null };
+
+  const normalized = stripMarkdownJsonFence(raw);
+  const parsed =
+    tryParseJsonObject(normalized) || tryParseJsonObject(extractJsonObject(normalized));
+  if (parsed) {
+    const reply = String(parsed.reply || parsed.message || parsed.text || "").trim();
+    const candidateUpdate =
+      parsed.candidate_update ||
+      parsed.candidateUpdate ||
+      parsed.candidate_record ||
+      parsed.candidateRecord ||
+      null;
+    const actions = normalizeAgentActions(parsed.actions || parsed.action || {});
+    if (looksLikeInternalLeak(reply)) {
+      log("[wecom-kf] agent reply looked like internal assessment; reply suppressed");
+      return {
+        reply: "",
+        candidateUpdate:
+          candidateUpdate && typeof candidateUpdate === "object" ? candidateUpdate : null,
+        actions,
+      };
+    }
+    return {
+      reply: reply || "NO_REPLY",
+      candidateUpdate:
+        candidateUpdate && typeof candidateUpdate === "object" ? candidateUpdate : null,
+      actions,
+    };
   }
 
-  return reply;
+  const salvagedReply =
+    extractStringField(normalized, "reply") ||
+    extractStringField(normalized, "message") ||
+    extractStringField(normalized, "text");
+  if (salvagedReply) {
+    if (looksLikeInternalLeak(salvagedReply)) {
+      log("[wecom-kf] salvaged reply looked like internal assessment; reply suppressed");
+      return { reply: "", candidateUpdate: null };
+    }
+    log("[wecom-kf] salvaged reply from malformed agent JSON");
+    return { reply: salvagedReply, candidateUpdate: null, actions: {} };
+  }
+
+  if (looksLikeJsonObject(raw) || looksLikeInternalLeak(raw)) {
+    log(
+      "[wecom-kf] agent returned malformed internal JSON; reply suppressed to avoid leaking assessment",
+    );
+    return { reply: "", candidateUpdate: null, actions: {} };
+  }
+
+  return { reply: raw, candidateUpdate: null, actions: {} };
+}
+
+function normalizeAgentActions(actions) {
+  if (!actions || typeof actions !== "object" || Array.isArray(actions)) return {};
+  return {
+    sendProjectPlanningTestPdf:
+      actions.send_project_planning_test_pdf === true ||
+      actions.sendProjectPlanningTestPdf === true,
+  };
+}
+
+function stripMarkdownJsonFence(text) {
+  return text
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+function extractJsonObject(text) {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end < start) return "";
+  return text.slice(start, end + 1);
+}
+
+function tryParseJsonObject(text) {
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractStringField(text, fieldName) {
+  const source = String(text || "");
+  const pattern = new RegExp(`["']?${escapeRegExp(fieldName)}["']?\\s*:`, "i");
+  const match = pattern.exec(source);
+  if (!match) return "";
+
+  let index = match.index + match[0].length;
+  while (index < source.length && /\s/.test(source[index])) index += 1;
+  if (index >= source.length) return "";
+
+  const quote = source[index];
+  if (quote === '"' || quote === "'") {
+    index += 1;
+    let value = "";
+    while (index < source.length) {
+      const char = source[index];
+      if (char === "\\") {
+        const next = source[index + 1];
+        if (next === "n") value += "\n";
+        else if (next === "r") value += "\r";
+        else if (next === "t") value += "\t";
+        else if (next) value += next;
+        index += 2;
+        continue;
+      }
+      if (char === quote) return value.trim();
+      value += char;
+      index += 1;
+    }
+    return value.trim();
+  }
+
+  const endMatch = /[,}\n\r]/.exec(source.slice(index));
+  const end = endMatch ? index + endMatch.index : source.length;
+  return source.slice(index, end).trim();
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function looksLikeJsonObject(text) {
+  const value = String(text || "").trim();
+  return /^\{[\s\S]*\}$/.test(value) || /"reply"\s*:/.test(value) || /'reply'\s*:/.test(value);
+}
+
+function looksLikeInternalLeak(text) {
+  return /candidate_update|candidateUpdate|candidate_record|candidateRecord|assessment|score|评分|加分|减分|总分|等级|内部简评|内部资料/i.test(
+    String(text || ""),
+  );
+}
+
+function loadCandidateAssessments() {
+  try {
+    const loaded = JSON.parse(fs.readFileSync(candidateAssessmentPath, "utf8"));
+    return loaded && typeof loaded === "object" && !Array.isArray(loaded)
+      ? { candidates: {}, ...loaded }
+      : { candidates: {} };
+  } catch {
+    return { candidates: {} };
+  }
+}
+
+function loadCandidateRecord(safeExternalUserId) {
+  const assessments = loadCandidateAssessments();
+  return assessments.candidates && typeof assessments.candidates === "object"
+    ? assessments.candidates[safeExternalUserId] || null
+    : null;
+}
+
+function saveCandidateRecord({
+  safeExternalUserId,
+  externalUserId,
+  update,
+  lastCandidateMessage,
+  lastReply,
+}) {
+  const assessments = loadCandidateAssessments();
+  const candidates =
+    assessments.candidates && typeof assessments.candidates === "object"
+      ? assessments.candidates
+      : {};
+  const current =
+    candidates[safeExternalUserId] && typeof candidates[safeExternalUserId] === "object"
+      ? candidates[safeExternalUserId]
+      : {};
+  const now = new Date().toISOString();
+  const next = mergeCandidateRecord(current, update);
+
+  next.externalUserId = externalUserId;
+  next.safeId = safeExternalUserId;
+  next.updatedAt = now;
+  next.lastCandidateMessage = lastCandidateMessage;
+  next.lastReply = lastReply || "";
+
+  candidates[safeExternalUserId] = next;
+  assessments.candidates = candidates;
+  assessments.updatedAt = now;
+  fs.writeFileSync(candidateAssessmentPath, JSON.stringify(assessments, null, 2), "utf8");
+  log(`[wecom-kf] candidate assessment updated: ${candidateAssessmentPath}`);
+}
+
+function mergeCandidateRecord(current, update) {
+  if (!update || typeof update !== "object" || Array.isArray(update)) return current || {};
+  return deepMerge(current || {}, update);
+}
+
+function deepMerge(base, update) {
+  if (Array.isArray(update)) {
+    return update.length > 0 ? update : Array.isArray(base) ? base : [];
+  }
+  if (!update || typeof update !== "object") {
+    if (update === null || update === "") return base ?? update;
+    return update;
+  }
+
+  const result = base && typeof base === "object" && !Array.isArray(base) ? { ...base } : {};
+  for (const [key, value] of Object.entries(update)) {
+    result[key] = deepMerge(result[key], value);
+  }
+  return result;
 }
 
 async function syncMessages({ token, openKfid }) {
@@ -342,6 +735,104 @@ async function sendText({ openKfid, externalUserId, text }) {
       text: { content: text },
     },
   );
+}
+
+function splitOutboundReply(text, { reserveSlots = 0 } = {}) {
+  const cleaned = sanitizeOutboundText(text);
+  if (!cleaned) return [];
+
+  const maxParts = Math.max(1, 5 - Number(reserveSlots || 0));
+  const parts = cleaned
+    .split(/\n\s*\n+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (parts.length <= 1) return [cleaned];
+  if (parts.length <= maxParts) return parts;
+
+  return [...parts.slice(0, maxParts - 1), parts.slice(maxParts - 1).join("\n\n")];
+}
+
+function sanitizeOutboundText(text) {
+  return String(text || "")
+    .replace(/他\s*[\/／]\s*她/g, "他")
+    .replace(/他[（(]\s*她\s*[)）]/g, "他")
+    .replace(/她\s*[\/／]\s*他/g, "他")
+    .replace(/她[（(]\s*他\s*[)）]/g, "他")
+    .trim();
+}
+
+async function sendProjectPlanningTestPdf({ openKfid, externalUserId }) {
+  if (!fs.existsSync(projectPlanningTestPdfPath)) {
+    throw new Error(`project planning test PDF is missing: ${projectPlanningTestPdfPath}`);
+  }
+
+  const stat = fs.statSync(projectPlanningTestPdfPath);
+  const maxBytes = 20 * 1024 * 1024;
+  if (!stat.isFile()) {
+    throw new Error(`project planning test PDF path is not a file: ${projectPlanningTestPdfPath}`);
+  }
+  if (stat.size <= 0) {
+    throw new Error(`project planning test PDF is empty: ${projectPlanningTestPdfPath}`);
+  }
+  if (stat.size > maxBytes) {
+    throw new Error(
+      `project planning test PDF is too large: ${stat.size} bytes, max ${maxBytes} bytes`,
+    );
+  }
+
+  const mediaId = await uploadTempMedia({
+    filePath: projectPlanningTestPdfPath,
+    mediaType: "file",
+    contentType: "application/pdf",
+  });
+
+  const accessToken = await getAccessToken();
+  return wecomJson(
+    `https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token=${encodeURIComponent(accessToken)}`,
+    {
+      touser: externalUserId,
+      open_kfid: openKfid,
+      msgtype: "file",
+      file: { media_id: mediaId },
+    },
+  );
+}
+
+async function uploadTempMedia({ filePath, mediaType, contentType }) {
+  const accessToken = await getAccessToken();
+  const fileName = path.basename(filePath);
+  const file = fs.readFileSync(filePath);
+  const boundary = `----openclaw-${crypto.randomBytes(12).toString("hex")}`;
+  const head = Buffer.from(
+    [
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="media"; filename="${escapeHeaderValue(fileName)}"`,
+      `Content-Type: ${contentType || "application/octet-stream"}`,
+      "",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8");
+  const bodyBuffer = Buffer.concat([head, file, tail]);
+
+  const res = await fetch(
+    `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${encodeURIComponent(accessToken)}&type=${encodeURIComponent(mediaType)}`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": `multipart/form-data; boundary=${boundary}`,
+        "content-length": String(bodyBuffer.length),
+      },
+      body: bodyBuffer,
+    },
+  );
+  const body = await res.json();
+  if (body.errcode !== 0 || !body.media_id) {
+    throw new Error(`upload media failed: ${JSON.stringify(redact(body))}`);
+  }
+  return body.media_id;
 }
 
 async function getAccessToken() {
@@ -471,6 +962,10 @@ function safeId(value) {
   return String(value)
     .replace(/[^a-zA-Z0-9_.-]/g, "_")
     .slice(0, 80);
+}
+
+function escapeHeaderValue(value) {
+  return String(value).replace(/["\r\n]/g, "_");
 }
 
 function redact(value) {
