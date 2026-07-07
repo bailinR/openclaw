@@ -136,12 +136,28 @@ function normalizeHistory(value) {
   if (!Array.isArray(value)) return [];
   return value
     .filter(isRecord)
-    .map((entry) => ({
-      role: readString(entry.role) || "unknown",
-      text: readString(entry.text),
-      at: readString(entry.at) || readString(entry.createdAt) || readString(entry.timestamp),
-    }))
+    .flatMap((entry) =>
+      splitHistoryEntry({
+        role: readString(entry.role) || "unknown",
+        text: readString(entry.text),
+        at: readString(entry.at) || readString(entry.createdAt) || readString(entry.timestamp),
+      }),
+    )
     .filter((entry) => entry.text || entry.at);
+}
+
+function splitHistoryEntry(entry) {
+  if (!isHrRole(entry.role)) return [entry];
+  const parts = entry.text
+    .split(/\n\s*\n+/u)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length <= 1) return [entry];
+  return parts.map((part) => ({ ...entry, text: part }));
+}
+
+function isHrRole(role) {
+  return /HR|assistant|客服|招聘|面试官/i.test(String(role || ""));
 }
 
 function displayNameForCandidate(id, assessment) {

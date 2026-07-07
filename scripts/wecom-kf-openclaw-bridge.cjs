@@ -232,6 +232,7 @@ async function processBatch(batch, { token }) {
   const reply = agentResult.reply || "";
   const actions = agentResult.actions || {};
   let sentReply = false;
+  let sentReplyParts = [];
 
   if (reply && !/^NO_REPLY$/i.test(reply)) {
     const outboundTexts = splitOutboundReply(reply, {
@@ -247,6 +248,7 @@ async function processBatch(batch, { token }) {
         });
       }
       sentReply = true;
+      sentReplyParts = outboundTexts;
       log(`[wecom-kf] replied to ${batch.externalUserId} (${outboundTexts.length} text part(s))`);
     } catch (err) {
       log(`[wecom-kf] send failed: ${err.message || err}`);
@@ -269,6 +271,7 @@ async function processBatch(batch, { token }) {
     externalUserId: batch.externalUserId,
     text,
     reply: sentReply ? reply : "",
+    replyParts: sentReply ? sentReplyParts : [],
     candidateUpdate: agentResult.candidateUpdate,
   });
 
@@ -502,7 +505,13 @@ async function fetchNewItemsBeforeSend({ token, openKfid, externalUserId, knownI
   return newerItems;
 }
 
-function saveFinalConversationAndAssessment({ externalUserId, text, reply, candidateUpdate }) {
+function saveFinalConversationAndAssessment({
+  externalUserId,
+  text,
+  reply,
+  replyParts,
+  candidateUpdate,
+}) {
   const safeExternalUserId = safeId(externalUserId);
   const historyPath = path.join(stateDir, `history-${safeExternalUserId}.json`);
 
@@ -517,7 +526,11 @@ function saveFinalConversationAndAssessment({ externalUserId, text, reply, candi
   history.push({ role: "候选人", text, at: new Date().toISOString() });
 
   if (reply && !/^NO_REPLY$/i.test(reply)) {
-    history.push({ role: "HR", text: reply, at: new Date().toISOString() });
+    const sentParts = Array.isArray(replyParts) && replyParts.length > 0 ? replyParts : [reply];
+    const at = new Date().toISOString();
+    for (const part of sentParts) {
+      history.push({ role: "HR", text: part, at });
+    }
   }
 
   fs.writeFileSync(historyPath, JSON.stringify(history.slice(-60), null, 2), "utf8");
@@ -707,6 +720,9 @@ function parseJobGuideAliases(content, fileName) {
   const aliasLine = content
     .split(/\r?\n/u)
     .find((line) => /^(岗位别名|aliases)\s*[:：]/iu.test(line.trim()));
+  if (!aliasLine && fileName.toLowerCase() === "sales.md") {
+    return ["sales", "销售", "销售岗"];
+  }
   const values = aliasLine
     ? aliasLine.replace(/^(岗位别名|aliases)\s*[:：]\s*/iu, "")
     : fileName.replace(/\.md$/iu, "");
