@@ -366,10 +366,18 @@ function buildFastInterviewTurn({ externalUserId, text }) {
     text,
   });
   if (!matchedJobGuide) {
-    if (shouldFastAskPosition({ candidateRecord, history, text })) {
-      log("[wecom-kf] fast interview asking position for new candidate");
+    if (shouldFastAskIdentityAndPosition({ candidateRecord, history, text })) {
+      log("[wecom-kf] fast interview asking identity and position");
       return {
         reply: openingQuestion(),
+        actions: {},
+        candidateUpdate: { stage: "初始沟通" },
+      };
+    }
+    if (shouldFastAskPositionOnly({ candidateRecord, history, text })) {
+      log("[wecom-kf] fast interview asking position");
+      return {
+        reply: "应聘哪个岗位？",
         actions: {},
         candidateUpdate: { stage: "初始沟通" },
       };
@@ -412,13 +420,24 @@ function positionFromGuideFile(fileName) {
   return fileName.replace(/\.md$/iu, "");
 }
 
-function shouldFastAskPosition({ candidateRecord, history, text }) {
+function shouldFastAskIdentityAndPosition({ candidateRecord, history, text }) {
   if (candidateRecord?.position || candidateRecord?.role) return false;
   if (history.some((item) => item.role === "HR")) return false;
   const normalized = normalizeQuestionText(text);
   if (!normalized) return true;
   if (/应聘|岗位|销售|策划|商务|运营|客服|开发|设计|产品/u.test(text)) return false;
   return /^(你好|您好|在吗|hi|hello|哈喽|嗨)$/iu.test(normalized) || normalized.length <= 12;
+}
+
+function shouldFastAskPositionOnly({ candidateRecord, history, text }) {
+  if (candidateRecord?.position || candidateRecord?.role) return false;
+  if (!history.some((item) => item.role === "HR")) return false;
+  if (/应聘|岗位|销售|策划|商务|运营|客服|开发|设计|产品/u.test(text)) return false;
+  return countHrMessages(history) < fastInterviewQuestionLimit;
+}
+
+function countHrMessages(history) {
+  return history.filter((item) => item.role === "HR").length;
 }
 
 function openingQuestion() {
