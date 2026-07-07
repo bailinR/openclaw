@@ -25,6 +25,9 @@ const agentId = process.env.OPENCLAW_JOBTEST_AGENT_ID || "job-agent";
 const intakeDelayMs = Number(process.env.WECOM_KF_INTAKE_DELAY_MS || 500);
 const replyPartDelayMs = Number(process.env.WECOM_KF_REPLY_PART_DELAY_MS || 2500);
 const preSendRecheckMax = Number(process.env.WECOM_KF_PRE_SEND_RECHECK_MAX || 3);
+const jobGuidesDir =
+  process.env.WECOM_KF_JOB_GUIDES_DIR || path.join(rootDir, "scripts", "wecom-kf-job-guides");
+const jobGuides = loadJobGuides(jobGuidesDir);
 
 const config = {
   corpId: need("WECOM_KF_CORP_ID"),
@@ -54,6 +57,7 @@ server.listen(port, "127.0.0.1", () => {
   log(`[wecom-kf] log file: ${logPath}`);
   log(`[wecom-kf] candidate assessment file: ${candidateAssessmentPath}`);
   log(`[wecom-kf] project planning test PDF: ${projectPlanningTestPdfPath}`);
+  log(`[wecom-kf] job guide dir: ${jobGuidesDir} (${jobGuides.length} guide(s))`);
   log(
     `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMs}ms; pre-send recheck max: ${preSendRecheckMax}`,
   );
@@ -288,6 +292,11 @@ async function runOpenClaw({ externalUserId, text }) {
     .slice(-30)
     .map((item) => `${item.role}：${item.text}`)
     .join("\n");
+  const matchedJobGuide = selectJobGuide({
+    candidateRecord,
+    recentHistory,
+    text,
+  });
 
   const messagePath = path.join(
     stateDir,
@@ -311,6 +320,12 @@ async function runOpenClaw({ externalUserId, text }) {
             work_status: "在职/离职/未知",
             education: "学历专业，未知填 null",
             years_experience: "工作年限，未知填 null",
+            hometown: "老家，未知填 null",
+            residence: "当前居住地或附近地铁站，未知填 null",
+            age: "年龄，未知填 null",
+            marital_child_status: "婚育、小孩情况、照看安排，未知填 null",
+            spouse_work: "配偶所在地和工作行业，未知填 null",
+            arrival_time: "最快到岗时间，未知填 null",
             project_planning_experience: "项目策划相关经历，未知填 null",
             representative_project: "代表项目或策划案例，未知填 null",
             planning_outputs: "方案、活动、商业计划、项目书等输出物经验，未知填 null",
@@ -321,6 +336,17 @@ async function runOpenClaw({ externalUserId, text }) {
             decision_level: "对接层级，未知填 null",
             sales_cycle: "成交周期，未知填 null",
             acquisition_channels: "获客方式，未知填 null",
+            sales_industry_product: "销售过的行业、产品和业务类型，未知填 null",
+            customer_mix: "客户结构占比，例如大B/小B/C端/G端，未知填 null",
+            customer_resource_source: "客户资源来源，自拓/公司分配/转介绍/其他渠道，未知填 null",
+            visit_and_close_count: "月拜访客户数、月成交客户数，未知填 null",
+            tender_experience: "招投标经验、项目规模、是否独立负责全流程投标，未知填 null",
+            order_value_payment_cycle: "客单价、回款周期、月任务和完成率，未知填 null",
+            annual_sales_by_company: "近两家公司年度销售业绩，未知填 null",
+            key_customers: "服务过的重点客户或代表客户，未知填 null",
+            team_management: "带团队人数、团队人均业绩和管理经验，未知填 null",
+            salary_structure: "底薪、薪资结构和考核标准，未知填 null",
+            commission_structure: "提成点数、阶梯和平均月提成，未知填 null",
             salary_expectation: "薪资期望或薪酬结构，未知填 null",
           },
           candidate_questions: ["候选人问过、需要面试官解答的问题"],
@@ -360,6 +386,13 @@ async function runOpenClaw({ externalUserId, text }) {
     "6. 候选人资料、评分、加减分明细是内部信息，只能放在 candidate_update，绝不能写进 reply。",
     "7. candidate_update 必须基于已知信息持续更新；不知道的字段填 null 或空数组，不要编造。",
     "8. 如果需要发送项目策划测试题 PDF，只能通过 actions.send_project_planning_test_pdf=true 触发；reply 里不要写服务器文件路径或内部动作名。",
+    "",
+    "岗位提问规则：",
+    matchedJobGuide
+      ? `已匹配岗位文件：${matchedJobGuide.fileName}\n${matchedJobGuide.content}`
+      : `未匹配到岗位文件。当前可匹配岗位别名：${
+          jobGuides.flatMap((guide) => guide.aliases).join("、") || "无"
+        }。如果候选人还没有明确岗位，先追问应聘岗位；明确岗位后按对应岗位文件继续提问。`,
     "",
     "本次新消息：",
     text,
@@ -650,6 +683,52 @@ function loadCandidateAssessments() {
   } catch {
     return { candidates: {} };
   }
+}
+
+function loadJobGuides(dir) {
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+
+  return names
+    .filter((name) => name.endsWith(".md") && name.toLowerCase() !== "readme.md")
+    .map((fileName) => {
+      const content = fs.readFileSync(path.join(dir, fileName), "utf8").trim();
+      const aliases = parseJobGuideAliases(content, fileName);
+      return { aliases, content, fileName };
+    })
+    .filter((guide) => guide.aliases.length > 0 && guide.content);
+}
+
+function parseJobGuideAliases(content, fileName) {
+  const aliasLine = content
+    .split(/\r?\n/u)
+    .find((line) => /^(岗位别名|aliases)\s*[:：]/iu.test(line.trim()));
+  const values = aliasLine
+    ? aliasLine.replace(/^(岗位别名|aliases)\s*[:：]\s*/iu, "")
+    : fileName.replace(/\.md$/iu, "");
+  return values
+    .split(/[、,，/|]/u)
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function selectJobGuide({ candidateRecord, recentHistory, text }) {
+  const haystack = [
+    text,
+    recentHistory,
+    candidateRecord?.position,
+    candidateRecord?.role,
+    candidateRecord?.stage,
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+
+  return jobGuides.find((guide) => guide.aliases.some((alias) => haystack.includes(alias)));
 }
 
 function loadCandidateRecord(safeExternalUserId) {
