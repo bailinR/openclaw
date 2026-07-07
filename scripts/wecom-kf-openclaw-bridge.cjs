@@ -25,6 +25,8 @@ const agentId = process.env.OPENCLAW_JOBTEST_AGENT_ID || "job-agent";
 const intakeDelayMs = Number(process.env.WECOM_KF_INTAKE_DELAY_MS || 500);
 const replyPartDelayMs = Number(process.env.WECOM_KF_REPLY_PART_DELAY_MS || 2500);
 const preSendRecheckMax = Number(process.env.WECOM_KF_PRE_SEND_RECHECK_MAX || 3);
+const openClawTimeoutMs = Number(process.env.OPENCLAW_JOBTEST_TIMEOUT_MS || 55000);
+const fastInterviewMode = process.env.WECOM_KF_FAST_INTERVIEW_MODE !== "0";
 const jobGuidesDir =
   process.env.WECOM_KF_JOB_GUIDES_DIR || path.join(rootDir, "scripts", "wecom-kf-job-guides");
 const jobGuides = loadJobGuides(jobGuidesDir);
@@ -59,7 +61,7 @@ server.listen(port, "127.0.0.1", () => {
   log(`[wecom-kf] project planning test PDF: ${projectPlanningTestPdfPath}`);
   log(`[wecom-kf] job guide dir: ${jobGuidesDir} (${jobGuides.length} guide(s))`);
   log(
-    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMs}ms; pre-send recheck max: ${preSendRecheckMax}`,
+    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; fast interview: ${fastInterviewMode ? "on" : "off"}`,
   );
 });
 
@@ -198,7 +200,7 @@ async function processBatch(batch, { token }) {
 
   let agentResult = { reply: "", actions: {}, candidateUpdate: null };
   try {
-    agentResult = await runOpenClaw({ externalUserId: batch.externalUserId, text });
+    agentResult = await runInterviewTurn({ externalUserId: batch.externalUserId, text });
 
     for (let attempt = 0; attempt < preSendRecheckMax; attempt += 1) {
       let newerItems = [];
@@ -221,7 +223,7 @@ async function processBatch(batch, { token }) {
       log(
         `[wecom-kf] found ${newerItems.length} newer message(s) before send; regenerating reply for ${batch.externalUserId}`,
       );
-      agentResult = await runOpenClaw({ externalUserId: batch.externalUserId, text });
+      agentResult = await runInterviewTurn({ externalUserId: batch.externalUserId, text });
     }
   } catch (err) {
     items.forEach((item) => remember(item.msgId));
@@ -278,18 +280,58 @@ async function processBatch(batch, { token }) {
   items.forEach((item) => remember(item.msgId));
 }
 
+async function runInterviewTurn({ externalUserId, text }) {
+  const fastResult = fastInterviewMode ? buildFastInterviewTurn({ externalUserId, text }) : null;
+  if (fastResult) return fastResult;
+  return runOpenClaw({ externalUserId, text });
+}
+
+function buildFastInterviewTurn({ externalUserId, text }) {
+  const safeExternalUserId = safeId(externalUserId);
+  const history = loadCandidateHistory(safeExternalUserId);
+  const candidateRecord = loadCandidateRecord(safeExternalUserId);
+  const recentHistory = history
+    .slice(-30)
+    .map((item) => `${item.role}：${item.text}`)
+    .join("\n");
+  const matchedJobGuide = selectJobGuide({
+    candidateRecord,
+    recentHistory,
+    text,
+  });
+  if (!matchedJobGuide) return null;
+
+  const question = pickNextGuideQuestion(
+    matchedJobGuide.content,
+    [recentHistory, text].filter(Boolean).join("\n"),
+  );
+  if (!question) return null;
+
+  log(`[wecom-kf] fast interview reply from ${matchedJobGuide.fileName}`);
+  return {
+    reply: question,
+    actions: {},
+    candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
+  };
+}
+
+function buildFastCandidateUpdate({ matchedJobGuide }) {
+  return {
+    position: positionFromGuideFile(matchedJobGuide.fileName),
+    stage: "初筛中",
+  };
+}
+
+function positionFromGuideFile(fileName) {
+  if (fileName === "sales.md") return "销售岗";
+  if (fileName === "project-planning.md") return "项目策划岗";
+  return fileName.replace(/\.md$/iu, "");
+}
+
 async function runOpenClaw({ externalUserId, text }) {
   const safeExternalUserId = safeId(externalUserId);
-  const historyPath = path.join(stateDir, `history-${safeExternalUserId}.json`);
   const candidateRecord = loadCandidateRecord(safeExternalUserId);
-
-  let history = [];
-  try {
-    const loaded = JSON.parse(fs.readFileSync(historyPath, "utf8"));
-    if (Array.isArray(loaded)) history = loaded;
-  } catch {
-    history = [];
-  }
+  const history = loadCandidateHistory(safeExternalUserId);
 
   const recentHistory = history
     .slice(-30)
@@ -420,7 +462,7 @@ async function runOpenClaw({ externalUserId, text }) {
     messagePath,
     "--json",
     "--timeout",
-    process.env.OPENCLAW_JOBTEST_TIMEOUT_SECONDS || "180",
+    process.env.OPENCLAW_JOBTEST_TIMEOUT_SECONDS || String(Math.ceil(openClawTimeoutMs / 1000)),
   ];
 
   log(`[wecom-kf] running OpenClaw agent=${agentId} session=${sessionKey}`);
@@ -429,11 +471,28 @@ async function runOpenClaw({ externalUserId, text }) {
   let candidateUpdate = null;
   let actions = {};
   try {
-    const output = await execFile(process.execPath, args, {
-      cwd: rootDir,
-      env: process.env,
-      timeout: Number(process.env.OPENCLAW_JOBTEST_TIMEOUT_MS || 240000),
-    });
+    let output = "";
+    try {
+      output = await execFile(process.execPath, args, {
+        cwd: rootDir,
+        env: process.env,
+        timeout: openClawTimeoutMs,
+      });
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        const fallbackReply = buildFastFallbackReply({
+          candidateRecord,
+          matchedJobGuide,
+          recentHistory,
+          text,
+        });
+        log(
+          `[wecom-kf] OpenClaw timed out after ${openClawTimeoutMs}ms; using fast fallback reply`,
+        );
+        return { reply: fallbackReply, actions: {}, candidateUpdate: null };
+      }
+      throw err;
+    }
 
     const start = output.indexOf("{");
     const end = output.lastIndexOf("}");
@@ -721,7 +780,7 @@ function loadJobGuides(dir) {
 
 function parseJobGuideAliases(content, fileName) {
   const aliasLine = content
-    .split(/\r?\n/u)
+    .split(/\r\n|\n|\r/u)
     .find((line) => /^(岗位别名|aliases)\s*[:：]/iu.test(line.trim()));
   if (!aliasLine && fileName.toLowerCase() === "sales.md") {
     return ["sales", "销售", "销售岗"];
@@ -750,11 +809,103 @@ function selectJobGuide({ candidateRecord, recentHistory, text }) {
   return jobGuides.find((guide) => guide.aliases.some((alias) => haystack.includes(alias)));
 }
 
+function isTimeoutError(err) {
+  return Boolean(
+    err &&
+    (err.code === "ETIMEDOUT" ||
+      err.killed === true ||
+      /timed?\s*out|timeout/i.test(String(err.message || ""))),
+  );
+}
+
+function buildFastFallbackReply({ candidateRecord, matchedJobGuide, recentHistory, text }) {
+  const missing = Array.isArray(candidateRecord?.next_missing_info)
+    ? candidateRecord.next_missing_info.find((item) => typeof item === "string" && item.trim())
+    : "";
+  if (missing) return questionFromText(missing);
+
+  const historyText = [recentHistory, text].filter(Boolean).join("\n");
+  const guideQuestion = matchedJobGuide
+    ? pickNextGuideQuestion(matchedJobGuide.content, historyText)
+    : "";
+  if (guideQuestion) return guideQuestion;
+
+  return "你应聘的是哪个岗位？";
+}
+
+function questionFromText(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (/[？?]$/u.test(text)) return text;
+  return `那方便说下${text}？`;
+}
+
+function pickNextGuideQuestion(content, historyText) {
+  const questions = extractGuideQuestions(content);
+  const normalizedHistory = normalizeQuestionText(historyText);
+  return (
+    questions.find((question) => {
+      const normalizedQuestion = normalizeQuestionText(question);
+      if (!normalizedQuestion) return false;
+      const probe = normalizedQuestion.slice(0, Math.min(12, normalizedQuestion.length));
+      return !normalizedHistory.includes(probe);
+    }) || ""
+  );
+}
+
+function extractGuideQuestions(content) {
+  const lines = String(content || "").split(/\r\n|\n|\r/u);
+  const questions = [];
+  let inQuestionBlock = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("题目：")) {
+      inQuestionBlock = true;
+      const inlineQuestion = trimmed.replace(/^题目：\s*/u, "");
+      questions.push(...splitNumberedQuestions(inlineQuestion));
+      continue;
+    }
+    if (trimmed.startsWith("分值：")) {
+      inQuestionBlock = false;
+      continue;
+    }
+    if (inQuestionBlock && trimmed) {
+      questions.push(...splitNumberedQuestions(trimmed));
+    }
+  }
+
+  return questions;
+}
+
+function splitNumberedQuestions(value) {
+  return String(value || "")
+    .split(/(?=\d+[.,，、])/u)
+    .map((item) => item.trim().replace(/^\d+[.,，、]\s*/u, ""))
+    .filter(Boolean);
+}
+
+function normalizeQuestionText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^\p{Letter}\p{Number}]+/gu, "");
+}
+
 function loadCandidateRecord(safeExternalUserId) {
   const assessments = loadCandidateAssessments();
   return assessments.candidates && typeof assessments.candidates === "object"
     ? assessments.candidates[safeExternalUserId] || null
     : null;
+}
+
+function loadCandidateHistory(safeExternalUserId) {
+  const historyPath = path.join(stateDir, `history-${safeExternalUserId}.json`);
+  try {
+    const loaded = JSON.parse(fs.readFileSync(historyPath, "utf8"));
+    return Array.isArray(loaded) ? loaded : [];
+  } catch {
+    return [];
+  }
 }
 
 function saveCandidateRecord({
