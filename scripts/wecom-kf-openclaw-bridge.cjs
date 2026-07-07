@@ -27,6 +27,7 @@ const replyPartDelayMs = Number(process.env.WECOM_KF_REPLY_PART_DELAY_MS || 2500
 const preSendRecheckMax = Number(process.env.WECOM_KF_PRE_SEND_RECHECK_MAX || 3);
 const openClawTimeoutMs = Number(process.env.OPENCLAW_JOBTEST_TIMEOUT_MS || 55000);
 const fastInterviewMode = process.env.WECOM_KF_FAST_INTERVIEW_MODE !== "0";
+const fastInterviewQuestionLimit = Number(process.env.WECOM_KF_FAST_INTERVIEW_QUESTION_LIMIT || 3);
 const jobGuidesDir =
   process.env.WECOM_KF_JOB_GUIDES_DIR || path.join(rootDir, "scripts", "wecom-kf-job-guides");
 const jobGuides = loadJobGuides(jobGuidesDir);
@@ -61,7 +62,7 @@ server.listen(port, "127.0.0.1", () => {
   log(`[wecom-kf] project planning test PDF: ${projectPlanningTestPdfPath}`);
   log(`[wecom-kf] job guide dir: ${jobGuidesDir} (${jobGuides.length} guide(s))`);
   log(
-    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; fast interview: ${fastInterviewMode ? "on" : "off"}`,
+    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; fast interview: ${fastInterviewMode ? "on" : "off"}; fast question limit: ${fastInterviewQuestionLimit}`,
   );
 });
 
@@ -301,13 +302,21 @@ function buildFastInterviewTurn({ externalUserId, text }) {
   });
   if (!matchedJobGuide) return null;
 
-  const question = pickNextGuideQuestion(
-    matchedJobGuide.content,
-    [recentHistory, text].filter(Boolean).join("\n"),
-  );
+  const historyText = [recentHistory, text].filter(Boolean).join("\n");
+  const fastQuestionCount = countAskedGuideQuestions(matchedJobGuide.content, historyText);
+  if (fastQuestionCount >= fastInterviewQuestionLimit) {
+    log(
+      `[wecom-kf] fast interview limit reached for ${matchedJobGuide.fileName} (${fastQuestionCount}/${fastInterviewQuestionLimit}); using OpenClaw`,
+    );
+    return null;
+  }
+
+  const question = pickNextGuideQuestion(matchedJobGuide.content, historyText);
   if (!question) return null;
 
-  log(`[wecom-kf] fast interview reply from ${matchedJobGuide.fileName}`);
+  log(
+    `[wecom-kf] fast interview reply from ${matchedJobGuide.fileName} (${fastQuestionCount + 1}/${fastInterviewQuestionLimit})`,
+  );
   return {
     reply: question,
     actions: {},
@@ -851,6 +860,16 @@ function pickNextGuideQuestion(content, historyText) {
       return !normalizedHistory.includes(probe);
     }) || ""
   );
+}
+
+function countAskedGuideQuestions(content, historyText) {
+  const normalizedHistory = normalizeQuestionText(historyText);
+  return extractGuideQuestions(content).filter((question) => {
+    const normalizedQuestion = normalizeQuestionText(question);
+    if (!normalizedQuestion) return false;
+    const probe = normalizedQuestion.slice(0, Math.min(12, normalizedQuestion.length));
+    return normalizedHistory.includes(probe);
+  }).length;
 }
 
 function extractGuideQuestions(content) {
