@@ -150,8 +150,18 @@ async function processCallback(xml) {
     .filter(Boolean)
     .filter((m) => !state.processedMsgIds.includes(m.msgId));
 
+  const textKeys = new Set(
+    pending
+      .filter((item) => item.kind === "text")
+      .map((item) => `${item.openKfid}\n${item.externalUserId}`),
+  );
+  for (const item of pending.filter((entry) => entry.kind === "enter")) {
+    const key = `${item.openKfid}\n${item.externalUserId}`;
+    if (!textKeys.has(key)) await processEnterSession(item);
+  }
+
   const batches = new Map();
-  for (const item of pending) {
+  for (const item of pending.filter((entry) => entry.kind === "text")) {
     const key = `${item.openKfid}\n${item.externalUserId}`;
     const batch = batches.get(key) || {
       openKfid: item.openKfid,
@@ -180,6 +190,32 @@ function normalizeMessage(message) {
 
   if (!msgId) return null;
 
+  if (msgtype === "event") {
+    const eventType = String(
+      message.event?.event_type ||
+        message.event_type ||
+        message.event?.event ||
+        message.event ||
+        "",
+    );
+    const eventExternalUserId = String(
+      message.external_userid || message.event?.external_userid || "",
+    );
+    const eventOpenKfid = String(
+      message.open_kfid || message.event?.open_kfid || config.openKfid || "",
+    );
+    if (isEnterSessionEvent(eventType) && eventExternalUserId && eventOpenKfid) {
+      return {
+        kind: "enter",
+        msgId,
+        externalUserId: eventExternalUserId,
+        openKfid: eventOpenKfid,
+      };
+    }
+    remember(msgId);
+    return null;
+  }
+
   if (msgtype !== "text" || !text || !externalUserId || !openKfid) {
     remember(msgId);
     return null;
@@ -190,7 +226,35 @@ function normalizeMessage(message) {
     return null;
   }
 
-  return { msgId, text, externalUserId, openKfid };
+  return { kind: "text", msgId, text, externalUserId, openKfid };
+}
+
+function isEnterSessionEvent(eventType) {
+  return /enter[_-]?session|user[_-]?enter|kf[_-]?user[_-]?enter/i.test(eventType);
+}
+
+async function processEnterSession(item) {
+  if (!shouldFastSendGreeting(item.externalUserId)) {
+    remember(item.msgId);
+    return;
+  }
+
+  const reply = openingQuestion();
+  try {
+    await sendText({
+      openKfid: item.openKfid,
+      externalUserId: item.externalUserId,
+      text: reply,
+    });
+    saveGreetingConversation({
+      externalUserId: item.externalUserId,
+      reply,
+    });
+    log(`[wecom-kf] greeted new candidate ${item.externalUserId}`);
+  } catch (err) {
+    log(`[wecom-kf] greeting send failed: ${err.message || err}`);
+  }
+  remember(item.msgId);
 }
 
 async function processBatch(batch, { token }) {
@@ -300,7 +364,17 @@ function buildFastInterviewTurn({ externalUserId, text }) {
     recentHistory,
     text,
   });
-  if (!matchedJobGuide) return null;
+  if (!matchedJobGuide) {
+    if (shouldFastAskPosition({ candidateRecord, history, text })) {
+      log("[wecom-kf] fast interview asking position for new candidate");
+      return {
+        reply: openingQuestion(),
+        actions: {},
+        candidateUpdate: { stage: "初始沟通" },
+      };
+    }
+    return null;
+  }
 
   const historyText = [recentHistory, text].filter(Boolean).join("\n");
   const fastQuestionCount = countAskedGuideQuestions(matchedJobGuide.content, historyText);
@@ -335,6 +409,27 @@ function positionFromGuideFile(fileName) {
   if (fileName === "sales.md") return "销售岗";
   if (fileName === "project-planning.md") return "项目策划岗";
   return fileName.replace(/\.md$/iu, "");
+}
+
+function shouldFastAskPosition({ candidateRecord, history, text }) {
+  if (candidateRecord?.position || candidateRecord?.role) return false;
+  if (history.some((item) => item.role === "HR")) return false;
+  const normalized = normalizeQuestionText(text);
+  if (!normalized) return true;
+  if (/应聘|岗位|销售|策划|商务|运营|客服|开发|设计|产品/u.test(text)) return false;
+  return /^(你好|您好|在吗|hi|hello|哈喽|嗨)$/iu.test(normalized) || normalized.length <= 12;
+}
+
+function openingQuestion() {
+  return "请问怎么称呼？应聘哪个岗位？";
+}
+
+function shouldFastSendGreeting(externalUserId) {
+  const safeExternalUserId = safeId(externalUserId);
+  const history = loadCandidateHistory(safeExternalUserId);
+  if (history.some((item) => item.role === "HR")) return false;
+  const candidateRecord = loadCandidateRecord(safeExternalUserId);
+  return !(candidateRecord?.position || candidateRecord?.role);
 }
 
 async function runOpenClaw({ externalUserId, text }) {
@@ -615,6 +710,21 @@ function saveFinalConversationAndAssessment({
       lastReply: reply || "",
     });
   }
+}
+
+function saveGreetingConversation({ externalUserId, reply }) {
+  const safeExternalUserId = safeId(externalUserId);
+  const historyPath = path.join(stateDir, `history-${safeExternalUserId}.json`);
+  const history = loadCandidateHistory(safeExternalUserId);
+  history.push({ role: "HR", text: reply, at: new Date().toISOString() });
+  fs.writeFileSync(historyPath, JSON.stringify(history.slice(-60), null, 2), "utf8");
+  saveCandidateRecord({
+    safeExternalUserId,
+    externalUserId,
+    update: { stage: "初始沟通" },
+    lastCandidateMessage: "",
+    lastReply: reply,
+  });
 }
 
 function parseAgentJsonReply(rawText) {
