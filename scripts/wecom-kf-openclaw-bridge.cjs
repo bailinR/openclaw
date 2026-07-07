@@ -385,6 +385,9 @@ async function runOpenClaw({ externalUserId, text }) {
     "3.1 如果 reply 里有两段且表达的是两层不同意思，中间用一个空行分隔，bridge 会分成两条微信消息发送。",
     "3.2 不要写“他/她”“他（她）”“她/他”这种不自然的不确定式称呼；需要泛指负责人或面试官时，用“他”或直接写“负责人”。",
     "4. 收集到的信息不需要发给求职者汇总确认。",
+    "4.1 不要总结、复述或确认候选人刚回答的内容；不要写“记下了”“收到”“了解了”“清楚了”“这块清楚了”“好的，已记录”“我这边记录一下”等承接语。",
+    "4.2 候选人回答有效且不需要追问时，直接进入岗位文件里的下一个问题。",
+    "4.3 只有候选人回答含糊、缺关键数字或明显答非所问时，才围绕当前问题追问；追问也不要先总结。",
     "5. 不要发送系统报错、日志、调试信息或内部失败原因。",
     "6. 候选人资料、评分、加减分明细是内部信息，只能放在 candidate_update，绝不能写进 reply。",
     "7. candidate_update 必须基于已知信息持续更新；不知道的字段填 null 或空数组，不要编造。",
@@ -849,12 +852,25 @@ function splitOutboundReply(text, { reserveSlots = 0 } = {}) {
 }
 
 function sanitizeOutboundText(text) {
-  return String(text || "")
+  return stripConfirmationLead(String(text || ""))
     .replace(/他\s*[\/／]\s*她/g, "他")
     .replace(/他[（(]\s*她\s*[)）]/g, "他")
     .replace(/她\s*[\/／]\s*他/g, "他")
     .replace(/她[（(]\s*他\s*[)）]/g, "他")
     .trim();
+}
+
+function stripConfirmationLead(text) {
+  let value = String(text || "").trimStart();
+  for (let i = 0; i < 3; i += 1) {
+    const next = value.replace(
+      /^\s*[^\n。！？!?]{0,80}(?:记下了|记录了|已记录|清楚了|明确了|收到了|了解了)[^\n。！？!?]*[。！？!?]?\s*/u,
+      "",
+    );
+    if (next === value) return value;
+    value = next.trimStart();
+  }
+  return value;
 }
 
 async function sendProjectPlanningTestPdf({ openKfid, externalUserId }) {
