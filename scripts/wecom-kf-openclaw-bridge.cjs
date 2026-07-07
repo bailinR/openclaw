@@ -46,6 +46,7 @@ fs.mkdirSync(path.dirname(projectPlanningTestPdfPath), { recursive: true });
 const state = loadState();
 let accessTokenCache = null;
 let processing = Promise.resolve();
+let candidateAssessmentsBroken = false;
 
 const server = http.createServer((req, res) => {
   void handleRequest(req, res).catch((err) => {
@@ -874,9 +875,36 @@ function loadCandidateAssessments() {
     return loaded && typeof loaded === "object" && !Array.isArray(loaded)
       ? { candidates: {}, ...loaded }
       : { candidates: {} };
-  } catch {
+  } catch (err) {
+    if (err && err.code === "ENOENT") return { candidates: {} };
+    markCandidateAssessmentsBroken(err);
     return { candidates: {} };
   }
+}
+
+function markCandidateAssessmentsBroken(err) {
+  if (candidateAssessmentsBroken) return;
+  candidateAssessmentsBroken = true;
+  const backupPath = `${candidateAssessmentPath}.broken-${new Date()
+    .toISOString()
+    .replace(/[:.]/g, "-")}`;
+  try {
+    if (fs.existsSync(candidateAssessmentPath)) {
+      fs.copyFileSync(candidateAssessmentPath, backupPath);
+      log(
+        `[wecom-kf] candidate assessment JSON is unreadable; backed up to ${backupPath}; candidate updates will be skipped until the JSON is fixed: ${err.message || err}`,
+      );
+      return;
+    }
+  } catch (backupErr) {
+    log(
+      `[wecom-kf] candidate assessment JSON is unreadable and backup failed; candidate updates will be skipped until the JSON is fixed: ${backupErr.message || backupErr}`,
+    );
+    return;
+  }
+  log(
+    `[wecom-kf] candidate assessment JSON is unreadable; candidate updates will be skipped until the JSON is fixed: ${err.message || err}`,
+  );
 }
 
 function loadJobGuides(dir) {
@@ -1044,7 +1072,19 @@ function saveCandidateRecord({
   lastCandidateMessage,
   lastReply,
 }) {
+  if (candidateAssessmentsBroken) {
+    log(
+      `[wecom-kf] candidate assessment update skipped because ${candidateAssessmentPath} is unreadable; fix or restore the JSON first`,
+    );
+    return;
+  }
   const assessments = loadCandidateAssessments();
+  if (candidateAssessmentsBroken) {
+    log(
+      `[wecom-kf] candidate assessment update skipped because ${candidateAssessmentPath} became unreadable while loading`,
+    );
+    return;
+  }
   const candidates =
     assessments.candidates && typeof assessments.candidates === "object"
       ? assessments.candidates
