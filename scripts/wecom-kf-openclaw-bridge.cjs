@@ -28,6 +28,9 @@ const preSendRecheckMax = Number(process.env.WECOM_KF_PRE_SEND_RECHECK_MAX || 3)
 const openClawTimeoutMs = Number(process.env.OPENCLAW_JOBTEST_TIMEOUT_MS || 55000);
 const fastInterviewMode = process.env.WECOM_KF_FAST_INTERVIEW_MODE !== "0";
 const fastInterviewQuestionLimit = Number(process.env.WECOM_KF_FAST_INTERVIEW_QUESTION_LIMIT || 3);
+const asyncAssessmentMode = process.env.WECOM_KF_ASYNC_ASSESSMENT_MODE !== "0";
+const asyncAssessmentTimeoutMs = Number(process.env.WECOM_KF_ASYNC_ASSESSMENT_TIMEOUT_MS || 90000);
+const openingFollowupDelayMs = Number(process.env.WECOM_KF_OPENING_FOLLOWUP_DELAY_MS || 60000);
 const jobGuidesDir =
   process.env.WECOM_KF_JOB_GUIDES_DIR || path.join(rootDir, "scripts", "wecom-kf-job-guides");
 const jobGuides = loadJobGuides(jobGuidesDir);
@@ -47,6 +50,7 @@ const state = loadState();
 let accessTokenCache = null;
 let processing = Promise.resolve();
 let candidateAssessmentsBroken = false;
+const asyncAssessmentQueues = new Map();
 
 const server = http.createServer((req, res) => {
   void handleRequest(req, res).catch((err) => {
@@ -63,7 +67,7 @@ server.listen(port, "127.0.0.1", () => {
   log(`[wecom-kf] project planning test PDF: ${projectPlanningTestPdfPath}`);
   log(`[wecom-kf] job guide dir: ${jobGuidesDir} (${jobGuides.length} guide(s))`);
   log(
-    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; fast interview: ${fastInterviewMode ? "on" : "off"}; fast question limit: ${fastInterviewQuestionLimit}`,
+    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; fast interview: ${fastInterviewMode ? "on" : "off"}; fast question limit: ${fastInterviewQuestionLimit}; async assessment: ${asyncAssessmentMode ? "on" : "off"}; async assessment timeout: ${asyncAssessmentTimeoutMs}ms; opening followup delay: ${openingFollowupDelayMs}ms`,
   );
 });
 
@@ -240,22 +244,49 @@ async function processEnterSession(item) {
     return;
   }
 
-  const reply = openingQuestion();
+  const reply = openingIntroMessage();
   try {
     await sendText({
       openKfid: item.openKfid,
       externalUserId: item.externalUserId,
       text: reply,
     });
-    saveGreetingConversation({
+    saveHrConversation({
       externalUserId: item.externalUserId,
       reply,
     });
+    scheduleOpeningBaselineQuestion(item);
     log(`[wecom-kf] greeted new candidate ${item.externalUserId}`);
   } catch (err) {
     log(`[wecom-kf] greeting send failed: ${err.message || err}`);
   }
   remember(item.msgId);
+}
+
+function scheduleOpeningBaselineQuestion(item) {
+  setTimeout(() => {
+    void sendOpeningBaselineQuestion(item).catch((err) => {
+      log(`[wecom-kf] opening baseline send failed: ${err.message || err}`);
+    });
+  }, openingFollowupDelayMs);
+}
+
+async function sendOpeningBaselineQuestion(item) {
+  const safeExternalUserId = safeId(item.externalUserId);
+  const history = loadCandidateHistory(safeExternalUserId);
+  if (hasAskedOpeningBaseline(history)) return;
+
+  const reply = openingBaselineQuestion();
+  await sendText({
+    openKfid: item.openKfid,
+    externalUserId: item.externalUserId,
+    text: reply,
+  });
+  saveHrConversation({
+    externalUserId: item.externalUserId,
+    reply,
+  });
+  log(`[wecom-kf] sent opening baseline question to ${item.externalUserId}`);
 }
 
 async function processBatch(batch, { token }) {
@@ -318,6 +349,12 @@ async function processBatch(batch, { token }) {
       sentReply = true;
       sentReplyParts = outboundTexts;
       log(`[wecom-kf] replied to ${batch.externalUserId} (${outboundTexts.length} text part(s))`);
+      if (actions.sendOpeningBaselineLater) {
+        scheduleOpeningBaselineQuestion({
+          openKfid: batch.openKfid,
+          externalUserId: batch.externalUserId,
+        });
+      }
     } catch (err) {
       log(`[wecom-kf] send failed: ${err.message || err}`);
     }
@@ -342,6 +379,9 @@ async function processBatch(batch, { token }) {
     replyParts: sentReply ? sentReplyParts : [],
     candidateUpdate: agentResult.candidateUpdate,
   });
+  enqueueCandidateAssessment({
+    externalUserId: batch.externalUserId,
+  });
 
   items.forEach((item) => remember(item.msgId));
 }
@@ -360,6 +400,14 @@ function buildFastInterviewTurn({ externalUserId, text }) {
     .slice(-30)
     .map((item) => `${item.role}：${item.text}`)
     .join("\n");
+  if (hasSentOpeningIntro(history) && !hasAskedOpeningBaseline(history)) {
+    log("[wecom-kf] fast interview asking opening baseline");
+    return {
+      reply: openingBaselineQuestion(),
+      actions: {},
+      candidateUpdate: { stage: "初始沟通" },
+    };
+  }
   const matchedJobGuide = selectJobGuide({
     candidateRecord,
     recentHistory,
@@ -367,17 +415,17 @@ function buildFastInterviewTurn({ externalUserId, text }) {
   });
   if (!matchedJobGuide) {
     if (shouldFastAskIdentityAndPosition({ candidateRecord, history, text })) {
-      log("[wecom-kf] fast interview asking identity and position");
+      log("[wecom-kf] fast interview sending opening intro");
       return {
-        reply: openingQuestion(),
-        actions: {},
+        reply: openingIntroMessage(),
+        actions: { sendOpeningBaselineLater: true },
         candidateUpdate: { stage: "初始沟通" },
       };
     }
     if (shouldFastAskPositionOnly({ candidateRecord, history, text })) {
       log("[wecom-kf] fast interview asking position");
       return {
-        reply: "应聘哪个岗位？",
+        reply: missingIdentityOrPositionQuestion(candidateRecord),
         actions: {},
         candidateUpdate: { stage: "初始沟通" },
       };
@@ -433,7 +481,11 @@ function shouldFastAskPositionOnly({ candidateRecord, history, text }) {
   if (candidateRecord?.position || candidateRecord?.role) return false;
   if (!history.some((item) => item.role === "HR")) return false;
   if (/应聘|岗位|销售|策划|商务|运营|客服|开发|设计|产品/u.test(text)) return false;
-  return countHrMessages(history) < fastInterviewQuestionLimit;
+  return true;
+}
+
+function missingIdentityOrPositionQuestion(candidateRecord) {
+  return candidateRecord?.name ? "应聘哪个岗位？" : "请问怎么称呼？应聘哪个岗位？";
 }
 
 function countHrMessages(history) {
@@ -441,7 +493,15 @@ function countHrMessages(history) {
 }
 
 function openingQuestion() {
-  return "请问怎么称呼？应聘哪个岗位？";
+  return openingIntroMessage();
+}
+
+function openingIntroMessage() {
+  return "您好，本次为微信线上初面，接下来我会依次向您提问，麻烦您结合自身真实情况如实作答即可，合适直接推老板（部门直属领导）复试，面试题目约有10-20左右，可能需要花费您10分钟时间耐心解答~[玫瑰]";
+}
+
+function openingBaselineQuestion() {
+  return "你这边是哪里人呀，目前住在哪里，最近的一份工作薪资以及期望薪资分别是多少哈？";
 }
 
 function shouldFastSendGreeting(externalUserId) {
@@ -474,60 +534,13 @@ async function runOpenClaw({ externalUserId, text }) {
   const prompt = [
     "你是企业微信招聘客服 bridge 的内部响应生成器。",
     "必须只输出一个合法 JSON 对象，不要使用 Markdown 代码块，不要输出 JSON 以外的文字。",
-    "bridge 只会把 reply 字段发给求职者，candidate_update 字段只写入内部候选人资料评分文件。",
+    "本轮只负责生成要发给求职者的微信回复，不要整理资料、不要评分、不要输出 candidate_update。",
     "reply 字段只能放候选人可见的微信正文，不得包含 JSON、candidate_update、assessment、score、评分、加分、减分、总分、等级等内部字段或明细。",
     "",
     "JSON 输出格式：",
     JSON.stringify(
       {
         reply: "要发给候选人的微信正文；如果不需要回复，填 NO_REPLY",
-        candidate_update: {
-          name: "候选人姓名，未知填 null",
-          position: "应聘岗位，未知填 null",
-          stage: "当前流程阶段，例如 初始沟通/销售初筛/测试题已发/待负责人确认",
-          known_info: {
-            work_status: "在职/离职/未知",
-            education: "学历专业，未知填 null",
-            years_experience: "工作年限，未知填 null",
-            hometown: "老家，未知填 null",
-            residence: "当前居住地或附近地铁站，未知填 null",
-            age: "年龄，未知填 null",
-            marital_child_status: "婚育、小孩情况、照看安排，未知填 null",
-            spouse_work: "配偶所在地和工作行业，未知填 null",
-            arrival_time: "最快到岗时间，未知填 null",
-            project_planning_experience: "项目策划相关经历，未知填 null",
-            representative_project: "代表项目或策划案例，未知填 null",
-            planning_outputs: "方案、活动、商业计划、项目书等输出物经验，未知填 null",
-            tools: "常用工具，未知填 null",
-            collaboration: "跨部门沟通、客户沟通或执行协调经验，未知填 null",
-            sales_performance: "销售业绩，未知填 null",
-            customer_type: "客户类型，未知填 null",
-            decision_level: "对接层级，未知填 null",
-            sales_cycle: "成交周期，未知填 null",
-            acquisition_channels: "获客方式，未知填 null",
-            sales_industry_product: "销售过的行业、产品和业务类型，未知填 null",
-            customer_mix: "客户结构占比，例如大B/小B/C端/G端，未知填 null",
-            customer_resource_source: "客户资源来源，自拓/公司分配/转介绍/其他渠道，未知填 null",
-            visit_and_close_count: "月拜访客户数、月成交客户数，未知填 null",
-            tender_experience: "招投标经验、项目规模、是否独立负责全流程投标，未知填 null",
-            order_value_payment_cycle: "客单价、回款周期、月任务和完成率，未知填 null",
-            annual_sales_by_company: "近两家公司年度销售业绩，未知填 null",
-            key_customers: "服务过的重点客户或代表客户，未知填 null",
-            team_management: "带团队人数、团队人均业绩和管理经验，未知填 null",
-            salary_structure: "底薪、薪资结构和考核标准，未知填 null",
-            commission_structure: "提成点数、阶梯和平均月提成，未知填 null",
-            salary_expectation: "薪资期望或薪酬结构，未知填 null",
-          },
-          candidate_questions: ["候选人问过、需要面试官解答的问题"],
-          next_missing_info: ["后续还需要补充了解的信息"],
-          assessment: {
-            score: "0-100 的数字；信息不足时也要基于已知信息给暂定分",
-            level: "信息不足/需谨慎/基本匹配/较匹配/优秀",
-            plus: [{ item: "加分项", points: 0, evidence: "依据" }],
-            minus: [{ item: "减分项", points: 0, evidence: "依据" }],
-            summary: "给招聘负责人看的内部简评，不要写给候选人",
-          },
-        },
         actions: {
           send_project_planning_test_pdf:
             "是否发送项目策划测试题 PDF，布尔值。只有项目策划候选人完成基础信息收集、准备正式发题时才填 true",
@@ -555,8 +568,8 @@ async function runOpenClaw({ externalUserId, text }) {
     "4.2 候选人回答有效且不需要追问时，直接进入岗位文件里的下一个问题。",
     "4.3 只有候选人回答含糊、缺关键数字或明显答非所问时，才围绕当前问题追问；追问也不要先总结。",
     "5. 不要发送系统报错、日志、调试信息或内部失败原因。",
-    "6. 候选人资料、评分、加减分明细是内部信息，只能放在 candidate_update，绝不能写进 reply。",
-    "7. candidate_update 必须基于已知信息持续更新；不知道的字段填 null 或空数组，不要编造。",
+    "6. 候选人资料、评分、加减分明细是内部信息，绝不能写进 reply。本轮不要输出 candidate_update，后台会单独整理评分。",
+    "7. 只决定当前应该如何回复求职者；资料沉淀、评分、总结交给后台任务处理。",
     "8. 如果需要发送项目策划测试题 PDF，只能通过 actions.send_project_planning_test_pdf=true 触发；reply 里不要写服务器文件路径或内部动作名。",
     "",
     "岗位提问规则：",
@@ -618,28 +631,7 @@ async function runOpenClaw({ externalUserId, text }) {
       throw err;
     }
 
-    const start = output.indexOf("{");
-    const end = output.lastIndexOf("}");
-    if (start < 0 || end < start) {
-      throw new Error(`OpenClaw returned non-JSON output: ${output.slice(0, 500)}`);
-    }
-
-    const result = JSON.parse(output.slice(start, end + 1));
-    const payloadText = Array.isArray(result.payloads)
-      ? result.payloads
-          .map((payload) => (typeof payload.text === "string" ? payload.text : ""))
-          .join("\n")
-          .trim()
-      : "";
-
-    const rawReply = (
-      payloadText ||
-      result.finalAssistantVisibleText ||
-      result.finalAssistantRawText ||
-      result.text ||
-      ""
-    ).trim();
-    const parsed = parseAgentJsonReply(rawReply);
+    const parsed = parseAgentJsonReply(extractAgentJsonText(output));
     reply = parsed.reply;
     candidateUpdate = parsed.candidateUpdate;
     actions = parsed.actions;
@@ -654,6 +646,221 @@ async function runOpenClaw({ externalUserId, text }) {
   }
 
   return { reply, actions, candidateUpdate };
+}
+
+function extractAgentJsonText(output) {
+  const start = output.indexOf("{");
+  const end = output.lastIndexOf("}");
+  if (start < 0 || end < start) {
+    throw new Error(`OpenClaw returned non-JSON output: ${output.slice(0, 500)}`);
+  }
+
+  const result = JSON.parse(output.slice(start, end + 1));
+  const payloadText = Array.isArray(result.payloads)
+    ? result.payloads
+        .map((payload) => (typeof payload.text === "string" ? payload.text : ""))
+        .join("\n")
+        .trim()
+    : "";
+
+  return (
+    payloadText ||
+    result.finalAssistantVisibleText ||
+    result.finalAssistantRawText ||
+    result.text ||
+    ""
+  ).trim();
+}
+
+function enqueueCandidateAssessment({ externalUserId }) {
+  if (!asyncAssessmentMode) return;
+  const safeExternalUserId = safeId(externalUserId);
+  const previous = asyncAssessmentQueues.get(safeExternalUserId) || Promise.resolve();
+  const next = previous
+    .catch(() => {})
+    .then(() => runCandidateAssessment({ externalUserId, safeExternalUserId }))
+    .catch((err) => {
+      log(`[wecom-kf] async candidate assessment failed: ${err.message || err}`);
+    })
+    .finally(() => {
+      if (asyncAssessmentQueues.get(safeExternalUserId) === next) {
+        asyncAssessmentQueues.delete(safeExternalUserId);
+      }
+    });
+  asyncAssessmentQueues.set(safeExternalUserId, next);
+}
+
+async function runCandidateAssessment({ externalUserId, safeExternalUserId }) {
+  if (candidateAssessmentsBroken) return;
+  const candidateRecord = loadCandidateRecord(safeExternalUserId);
+  const history = loadCandidateHistory(safeExternalUserId);
+  if (history.length === 0) return;
+
+  const recentHistory = history
+    .slice(-40)
+    .map((item) => `${item.role}：${item.text}`)
+    .join("\n");
+  const matchedJobGuide = selectJobGuide({
+    candidateRecord,
+    recentHistory,
+    text: "",
+  });
+  const latestCandidateMessage =
+    [...history].reverse().find((item) => item.role !== "HR")?.text || "";
+  const latestReply = [...history].reverse().find((item) => item.role === "HR")?.text || "";
+  const messagePath = path.join(
+    stateDir,
+    `assessment-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.txt`,
+  );
+  const prompt = [
+    "你是企业微信招聘面试记录的后台资料整理与评分器。",
+    "必须只输出一个合法 JSON 对象，不要使用 Markdown 代码块，不要输出 JSON 以外的文字。",
+    "本任务在微信回复已经发出后异步执行，不要生成要发给求职者的话，只更新内部 candidate_update。",
+    "",
+    "JSON 输出格式：",
+    JSON.stringify(
+      {
+        candidate_update: buildCandidateUpdateTemplate(),
+      },
+      null,
+      2,
+    ),
+    "",
+    "已积累候选人资料评分：",
+    JSON.stringify(candidateRecord || {}, null, 2),
+    "",
+    "最近对话记录：",
+    recentHistory || "暂无",
+    "",
+    "整理要求：",
+    "1. 只根据已知对话和已积累资料更新 candidate_update，不要编造信息。",
+    "2. 不知道的字段填 null 或空数组；已有资料中明确的信息不要因为本轮未提到而清空。",
+    "3. 根据候选人应聘岗位和岗位评分标准持续更新评分、加减分和内部简评。",
+    "4. 如果岗位文件中的某个问题已经由通用开场问题覆盖，例如哪里人、住哪里、最近薪资、期望薪资，就直接基于回答评分，不要认为缺失。",
+    "5. candidate_questions 只记录候选人主动问过、需要面试官解答的问题。",
+    "6. next_missing_info 只放后续仍需追问的关键信息，避免重复已经问过且已回答的信息。",
+    "",
+    "岗位评分标准：",
+    matchedJobGuide
+      ? `已匹配岗位文件：${matchedJobGuide.fileName}\n${matchedJobGuide.content}`
+      : `未匹配到岗位文件。当前可匹配岗位别名：${
+          jobGuides.flatMap((guide) => guide.aliases).join("、") || "无"
+        }。如果对话中岗位已明确，请写入 candidate_update.position。`,
+  ].join("\n");
+
+  fs.writeFileSync(messagePath, prompt, "utf8");
+
+  const sessionKey = `agent:${agentId}:wecom-kf-assessment-${safeExternalUserId}`;
+  const args = [
+    "scripts/run-node.mjs",
+    "--dev",
+    "agent",
+    "--agent",
+    agentId,
+    "--local",
+    "--session-key",
+    sessionKey,
+    "--message-file",
+    messagePath,
+    "--json",
+    "--timeout",
+    process.env.WECOM_KF_ASYNC_ASSESSMENT_TIMEOUT_SECONDS ||
+      String(Math.ceil(asyncAssessmentTimeoutMs / 1000)),
+  ];
+
+  log(`[wecom-kf] running async assessment agent=${agentId} session=${sessionKey}`);
+
+  try {
+    const output = await execFile(process.execPath, args, {
+      cwd: rootDir,
+      env: process.env,
+      timeout: asyncAssessmentTimeoutMs,
+    });
+    const candidateUpdate = parseCandidateUpdateReply(extractAgentJsonText(output));
+    if (!candidateUpdate) {
+      log("[wecom-kf] async assessment returned no candidate_update");
+      return;
+    }
+    saveCandidateRecord({
+      safeExternalUserId,
+      externalUserId,
+      update: candidateUpdate,
+      lastCandidateMessage: latestCandidateMessage,
+      lastReply: latestReply,
+    });
+  } finally {
+    try {
+      fs.unlinkSync(messagePath);
+    } catch {}
+  }
+}
+
+function buildCandidateUpdateTemplate() {
+  return {
+    name: "候选人姓名，未知填 null",
+    position: "应聘岗位，未知填 null",
+    stage: "当前流程阶段，例如 初始沟通/销售初筛/测试题已发/待负责人确认",
+    known_info: {
+      work_status: "在职/离职/未知",
+      education: "学历专业，未知填 null",
+      years_experience: "工作年限，未知填 null",
+      hometown: "老家，未知填 null",
+      residence: "当前居住地或附近地铁站，未知填 null",
+      age: "年龄，未知填 null",
+      marital_child_status: "婚育、小孩情况、照看安排，未知填 null",
+      spouse_work: "配偶所在地和工作行业，未知填 null",
+      arrival_time: "最快到岗时间，未知填 null",
+      project_planning_experience: "项目策划相关经历，未知填 null",
+      representative_project: "代表项目或策划案例，未知填 null",
+      planning_outputs: "方案、活动、商业计划、项目书等输出物经验，未知填 null",
+      tools: "常用工具，未知填 null",
+      collaboration: "跨部门沟通、客户沟通或执行协调经验，未知填 null",
+      sales_performance: "销售业绩，未知填 null",
+      customer_type: "客户类型，未知填 null",
+      decision_level: "对接层级，未知填 null",
+      sales_cycle: "成交周期，未知填 null",
+      acquisition_channels: "获客方式，未知填 null",
+      sales_industry_product: "销售过的行业、产品和业务类型，未知填 null",
+      customer_mix: "客户结构占比，例如大B/小B/C端/G端，未知填 null",
+      customer_resource_source: "客户资源来源，自拓/公司分配/转介绍/其他渠道，未知填 null",
+      visit_and_close_count: "月拜访客户数、月成交客户数，未知填 null",
+      tender_experience: "招投标经验、项目规模、是否独立负责全流程投标，未知填 null",
+      order_value_payment_cycle: "客单价、回款周期、月任务和完成率，未知填 null",
+      annual_sales_by_company: "近两家公司年度销售业绩，未知填 null",
+      key_customers: "服务过的重点客户或代表客户，未知填 null",
+      team_management: "带团队人数、团队人均业绩和管理经验，未知填 null",
+      salary_structure: "底薪、薪资结构和考核标准，未知填 null",
+      commission_structure: "提成点数、阶梯和平均月提成，未知填 null",
+      salary_expectation: "薪资期望或薪酬结构，未知填 null",
+    },
+    candidate_questions: ["候选人问过、需要面试官解答的问题"],
+    next_missing_info: ["后续还需要补充了解的信息"],
+    assessment: {
+      score: "0-100 的数字；信息不足时也要基于已知信息给暂定分",
+      level: "信息不足/需谨慎/基本匹配/较匹配/优秀",
+      plus: [{ item: "加分项", points: 0, evidence: "依据" }],
+      minus: [{ item: "减分项", points: 0, evidence: "依据" }],
+      summary: "给招聘负责人看的内部简评，不要写给候选人",
+    },
+  };
+}
+
+function parseCandidateUpdateReply(rawText) {
+  const raw = String(rawText || "").trim();
+  if (!raw) return null;
+  const normalized = stripMarkdownJsonFence(raw);
+  const parsed =
+    tryParseJsonObject(normalized) || tryParseJsonObject(extractJsonObject(normalized));
+  if (!parsed) return null;
+  const candidateUpdate =
+    parsed.candidate_update ||
+    parsed.candidateUpdate ||
+    parsed.candidate_record ||
+    parsed.candidateRecord ||
+    null;
+  return candidateUpdate && typeof candidateUpdate === "object" && !Array.isArray(candidateUpdate)
+    ? candidateUpdate
+    : null;
 }
 
 function buildBatchText(items, { beforeSendRegeneration = false } = {}) {
@@ -732,7 +939,7 @@ function saveFinalConversationAndAssessment({
   }
 }
 
-function saveGreetingConversation({ externalUserId, reply }) {
+function saveHrConversation({ externalUserId, reply }) {
   const safeExternalUserId = safeId(externalUserId);
   const historyPath = path.join(stateDir, `history-${safeExternalUserId}.json`);
   const history = loadCandidateHistory(safeExternalUserId);
@@ -1011,22 +1218,77 @@ function pickNextGuideQuestion(content, historyText) {
   const normalizedHistory = normalizeQuestionText(historyText);
   return (
     questions.find((question) => {
-      const normalizedQuestion = normalizeQuestionText(question);
-      if (!normalizedQuestion) return false;
-      const probe = normalizedQuestion.slice(0, Math.min(12, normalizedQuestion.length));
-      return !normalizedHistory.includes(probe);
+      return !isGuideQuestionCoveredByHistory(question, normalizedHistory);
     }) || ""
   );
 }
 
 function countAskedGuideQuestions(content, historyText) {
   const normalizedHistory = normalizeQuestionText(historyText);
-  return extractGuideQuestions(content).filter((question) => {
-    const normalizedQuestion = normalizeQuestionText(question);
-    if (!normalizedQuestion) return false;
-    const probe = normalizedQuestion.slice(0, Math.min(12, normalizedQuestion.length));
-    return normalizedHistory.includes(probe);
-  }).length;
+  return extractGuideQuestions(content).filter((question) =>
+    isExactGuideQuestionInHistory(question, normalizedHistory),
+  ).length;
+}
+
+function isGuideQuestionCoveredByHistory(question, normalizedHistory) {
+  if (isExactGuideQuestionInHistory(question, normalizedHistory)) return true;
+  return isCoveredByOpeningBaseline(question, normalizedHistory);
+}
+
+function isExactGuideQuestionInHistory(question, normalizedHistory) {
+  const normalizedQuestion = normalizeQuestionText(question);
+  if (!normalizedQuestion) return false;
+  const probe = normalizedQuestion.slice(0, Math.min(12, normalizedQuestion.length));
+  return normalizedHistory.includes(probe);
+}
+
+function isCoveredByOpeningBaseline(question, normalizedHistory) {
+  if (!hasAskedOpeningBaselineText(normalizedHistory)) return false;
+  const normalizedQuestion = normalizeQuestionText(question);
+  if (/哪里人|老家/u.test(question)) return true;
+  if (/住在哪里|居住|地铁站/u.test(question)) return true;
+  if (normalizedQuestion.includes("期望") && normalizedQuestion.includes("薪资")) return true;
+  if (
+    normalizedQuestion.includes("薪资") &&
+    /(最近|上一家|一家公司|一份工作)/u.test(question) &&
+    !/(结构|考核|提成|绩效|奖金)/u.test(question)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function hasAskedOpeningBaseline(history) {
+  const normalizedHistory = normalizeQuestionText(
+    history
+      .filter((item) => item.role === "HR")
+      .map((item) => item.text)
+      .join("\n"),
+  );
+  return hasAskedOpeningBaselineText(normalizedHistory);
+}
+
+function hasSentOpeningIntro(history) {
+  const normalizedHistory = normalizeQuestionText(
+    history
+      .filter((item) => item.role === "HR")
+      .map((item) => item.text)
+      .join("\n"),
+  );
+  const intro = normalizeQuestionText(openingIntroMessage());
+  const probe = intro.slice(0, Math.min(18, intro.length));
+  return normalizedHistory.includes(probe);
+}
+
+function hasAskedOpeningBaselineText(normalizedHistory) {
+  const baseline = normalizeQuestionText(openingBaselineQuestion());
+  const probe = baseline.slice(0, Math.min(18, baseline.length));
+  return (
+    normalizedHistory.includes(probe) ||
+    (normalizedHistory.includes("哪里人") &&
+      normalizedHistory.includes("住在哪里") &&
+      normalizedHistory.includes("期望薪资"))
+  );
 }
 
 function extractGuideQuestions(content) {
