@@ -38,9 +38,9 @@ const identityFollowupDelayMs = Number(process.env.WECOM_KF_IDENTITY_FOLLOWUP_DE
 const asyncAssessmentMode = process.env.WECOM_KF_ASYNC_ASSESSMENT_MODE !== "0";
 const asyncAssessmentTimeoutMs = Number(process.env.WECOM_KF_ASYNC_ASSESSMENT_TIMEOUT_MS || 90000);
 const asyncAssessmentQuietMs = Number(process.env.WECOM_KF_ASYNC_ASSESSMENT_QUIET_MS || 5000);
-const interviewSupplementPrompt =
+const defaultInterviewSupplementPrompt =
   process.env.WECOM_KF_INTERVIEW_SUPPLEMENT_PROMPT || "您还有什么要补充的吗？";
-const interviewCompleteMessage =
+const defaultInterviewCompleteMessage =
   process.env.WECOM_KF_INTERVIEW_COMPLETE_MESSAGE ||
   "感谢您的配合，后续我们会进行一个综合评估，如果进入复试，有消息会第一时间联系您。";
 const jobGuidesDir =
@@ -485,23 +485,25 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode })
 
   const question = pickNextGuideQuestion(matchedJobGuide.content, historyText, askedGuideQuestions);
   if (!question) {
+    const supplementPrompt = getInterviewSupplementPrompt(matchedJobGuide);
+    const completeMessage = getInterviewCompleteMessage(matchedJobGuide);
     if (hasCompletedGuide(candidateRecord, matchedJobGuide.fileName)) {
       return { reply: "NO_REPLY", actions: {}, candidateUpdate: null };
     }
     if (hasPromptedInterviewSupplement(candidateRecord, matchedJobGuide.fileName)) {
-      if (!hasCandidateRepliedAfterInterviewSupplement(history, text)) {
+      if (!hasCandidateRepliedAfterInterviewSupplement(history, text, supplementPrompt)) {
         return { reply: "NO_REPLY", actions: {}, candidateUpdate: null };
       }
       log(`[wecom-kf] strict guide interview completed for ${matchedJobGuide.fileName}`);
       return {
-        reply: interviewCompleteMessage,
+        reply: completeMessage,
         actions: {},
         candidateUpdate: buildGuideCompleteCandidateUpdate({ matchedJobGuide }),
       };
     }
     log(`[wecom-kf] strict guide interview completed for ${matchedJobGuide.fileName}`);
     return {
-      reply: interviewSupplementPrompt,
+      reply: supplementPrompt,
       actions: {},
       candidateUpdate: buildInterviewSupplementPromptCandidateUpdate({ matchedJobGuide }),
     };
@@ -583,18 +585,35 @@ function hasPromptedInterviewSupplement(candidateRecord, guideFileName) {
   return Boolean(candidateRecord?.interview_final_prompted?.[guideFileName]);
 }
 
-function hasCandidateRepliedAfterInterviewSupplement(history, currentCandidateText) {
-  const normalizedPrompt = normalizeQuestionText(interviewSupplementPrompt);
+function hasCandidateRepliedAfterInterviewSupplement(
+  history,
+  currentCandidateText,
+  supplementPrompt,
+) {
+  const normalizedCurrentText = normalizeQuestionText(currentCandidateText);
+  const normalizedPrompt = normalizeQuestionText(supplementPrompt);
   for (let index = history.length - 1; index >= 0; index -= 1) {
     const item = history[index];
     if (item.role !== "HR") continue;
     if (!normalizeQuestionText(item.text).includes(normalizedPrompt)) continue;
     return (
       history.slice(index + 1).some((entry) => entry.role !== "HR") ||
-      Boolean(normalizeQuestionText(currentCandidateText))
+      Boolean(normalizedCurrentText)
     );
   }
-  return false;
+  return Boolean(normalizedCurrentText);
+}
+
+function getInterviewSupplementPrompt(matchedJobGuide) {
+  return (
+    extractPromptSection(matchedJobGuide?.content, "补充问题") || defaultInterviewSupplementPrompt
+  );
+}
+
+function getInterviewCompleteMessage(matchedJobGuide) {
+  return (
+    extractPromptSection(matchedJobGuide?.content, "完成话术") || defaultInterviewCompleteMessage
+  );
 }
 
 function positionFromGuideFile(fileName) {
