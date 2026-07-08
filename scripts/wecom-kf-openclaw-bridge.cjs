@@ -489,7 +489,7 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode })
       return { reply: "NO_REPLY", actions: {}, candidateUpdate: null };
     }
     if (hasPromptedInterviewSupplement(candidateRecord, matchedJobGuide.fileName)) {
-      if (!hasCandidateRepliedAfterInterviewSupplement(history)) {
+      if (!hasCandidateRepliedAfterInterviewSupplement(history, text)) {
         return { reply: "NO_REPLY", actions: {}, candidateUpdate: null };
       }
       log(`[wecom-kf] strict guide interview completed for ${matchedJobGuide.fileName}`);
@@ -583,13 +583,16 @@ function hasPromptedInterviewSupplement(candidateRecord, guideFileName) {
   return Boolean(candidateRecord?.interview_final_prompted?.[guideFileName]);
 }
 
-function hasCandidateRepliedAfterInterviewSupplement(history) {
+function hasCandidateRepliedAfterInterviewSupplement(history, currentCandidateText) {
   const normalizedPrompt = normalizeQuestionText(interviewSupplementPrompt);
   for (let index = history.length - 1; index >= 0; index -= 1) {
     const item = history[index];
     if (item.role !== "HR") continue;
     if (!normalizeQuestionText(item.text).includes(normalizedPrompt)) continue;
-    return history.slice(index + 1).some((entry) => entry.role !== "HR");
+    return (
+      history.slice(index + 1).some((entry) => entry.role !== "HR") ||
+      Boolean(normalizeQuestionText(currentCandidateText))
+    );
   }
   return false;
 }
