@@ -33,8 +33,6 @@ const preSendRecheckMax = Number(process.env.WECOM_KF_PRE_SEND_RECHECK_MAX || 3)
 const openClawTimeoutMs = Number(process.env.OPENCLAW_JOBTEST_TIMEOUT_MS || 55000);
 const replyJudgeEnabled = process.env.WECOM_KF_REPLY_JUDGE_MODE === "1";
 const replyJudgeTimeoutMs = Number(process.env.WECOM_KF_REPLY_JUDGE_TIMEOUT_MS || 20000);
-const fastInterviewMode = process.env.WECOM_KF_FAST_INTERVIEW_MODE !== "0";
-const fastInterviewQuestionLimit = Number(process.env.WECOM_KF_FAST_INTERVIEW_QUESTION_LIMIT || 3);
 const identityFollowupDelayMs = Number(process.env.WECOM_KF_IDENTITY_FOLLOWUP_DELAY_MS || 60000);
 const asyncAssessmentMode = process.env.WECOM_KF_ASYNC_ASSESSMENT_MODE !== "0";
 const asyncAssessmentTimeoutMs = Number(process.env.WECOM_KF_ASYNC_ASSESSMENT_TIMEOUT_MS || 90000);
@@ -84,7 +82,7 @@ server.listen(port, "127.0.0.1", () => {
   log(`[wecom-kf] job overview file: ${jobOverviewPath}`);
   log(`[wecom-kf] job guide dir: ${jobGuidesDir} (${jobGuides.length} guide(s))`);
   log(
-    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMinMs}-${replyPartDelayMaxMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; reply judge: ${replyJudgeEnabled ? "on" : "off"}; reply judge timeout: ${replyJudgeTimeoutMs}ms; fast interview: ${fastInterviewMode ? "on" : "off"}; fast question limit: ${fastInterviewQuestionLimit}; identity followup delay: ${identityFollowupDelayMs}ms; async assessment: ${asyncAssessmentMode ? "on" : "off"}; async assessment timeout: ${asyncAssessmentTimeoutMs}ms; async assessment quiet: ${asyncAssessmentQuietMs}ms`,
+    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMinMs}-${replyPartDelayMaxMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; reply judge: ${replyJudgeEnabled ? "on" : "off"}; reply judge timeout: ${replyJudgeTimeoutMs}ms; strict guide questions: on; identity followup delay: ${identityFollowupDelayMs}ms; async assessment: ${asyncAssessmentMode ? "on" : "off"}; async assessment timeout: ${asyncAssessmentTimeoutMs}ms; async assessment quiet: ${asyncAssessmentQuietMs}ms`,
   );
 });
 
@@ -436,14 +434,12 @@ function hasHrAskedExact(history, reply) {
 }
 
 async function runInterviewTurn({ externalUserId, text }) {
-  const fastResult = fastInterviewMode
-    ? await buildFastInterviewTurn({ externalUserId, text })
-    : null;
-  if (fastResult) return fastResult;
+  const strictGuideResult = await buildStrictGuideInterviewTurn({ externalUserId, text });
+  if (strictGuideResult) return strictGuideResult;
   return runOpenClaw({ externalUserId, text });
 }
 
-async function buildFastInterviewTurn({ externalUserId, text }) {
+async function buildStrictGuideInterviewTurn({ externalUserId, text }) {
   const safeExternalUserId = safeId(externalUserId);
   const history = loadCandidateHistory(safeExternalUserId);
   const candidateRecord = loadCandidateRecord(safeExternalUserId);
@@ -459,7 +455,7 @@ async function buildFastInterviewTurn({ externalUserId, text }) {
   const identityStatus = getIdentityStatus({ candidateRecord, history, text, matchedJobGuide });
   if (!matchedJobGuide) {
     if (shouldFastAskIdentityAndPosition({ candidateRecord, history, text })) {
-      log("[wecom-kf] fast interview asking identity and position");
+      log("[wecom-kf] strict guide interview asking identity and position");
       return {
         reply: identityAndPositionQuestion(),
         actions: {},
@@ -467,7 +463,7 @@ async function buildFastInterviewTurn({ externalUserId, text }) {
       };
     }
     if (shouldWaitForIdentityFollowup({ candidateRecord, history, text, identityStatus })) {
-      log("[wecom-kf] fast interview waiting before identity followup");
+      log("[wecom-kf] strict guide interview waiting before identity followup");
       return {
         reply: "NO_REPLY",
         actions: { scheduleIdentityFollowup: true },
@@ -479,18 +475,12 @@ async function buildFastInterviewTurn({ externalUserId, text }) {
 
   const historyText = [recentHistory, text].filter(Boolean).join("\n");
   const fastQuestionCount = countAskedGuideQuestions(matchedJobGuide.content, historyText);
-  if (fastQuestionCount >= fastInterviewQuestionLimit) {
-    log(
-      `[wecom-kf] fast interview limit reached for ${matchedJobGuide.fileName} (${fastQuestionCount}/${fastInterviewQuestionLimit}); using OpenClaw`,
-    );
-    return null;
-  }
 
   const question = pickNextGuideQuestion(matchedJobGuide.content, historyText);
   if (!question) return null;
 
   if (!hasSentOpeningIntro(history) && !identityStatus.complete) {
-    log("[wecom-kf] fast interview waiting before identity followup");
+    log("[wecom-kf] strict guide interview waiting before identity followup");
     return {
       reply: "NO_REPLY",
       actions: { scheduleIdentityFollowup: true },
@@ -500,7 +490,7 @@ async function buildFastInterviewTurn({ externalUserId, text }) {
 
   if (!hasSentOpeningIntro(history)) {
     log(
-      `[wecom-kf] fast interview sending opening intro and first ${matchedJobGuide.fileName} question`,
+      `[wecom-kf] strict guide interview sending opening intro and first ${matchedJobGuide.fileName} question`,
     );
     return {
       reply: `好的\n\n${openingIntroMessage()}\n\n${question}`,
@@ -519,7 +509,7 @@ async function buildFastInterviewTurn({ externalUserId, text }) {
       matchedJobGuide,
     });
     if (answerDecision.action === "followup" && answerDecision.reply) {
-      log("[wecom-kf] fast interview followup from answer judge");
+      log("[wecom-kf] strict guide interview followup from answer judge");
       return {
         reply: answerDecision.reply,
         actions: {},
@@ -527,7 +517,7 @@ async function buildFastInterviewTurn({ externalUserId, text }) {
       };
     }
     if (answerDecision.action === "wait") {
-      log("[wecom-kf] fast interview answer judge chose no reply");
+      log("[wecom-kf] strict guide interview answer judge chose no reply");
       return {
         reply: "NO_REPLY",
         actions: {},
@@ -537,7 +527,7 @@ async function buildFastInterviewTurn({ externalUserId, text }) {
   }
 
   log(
-    `[wecom-kf] fast interview reply from ${matchedJobGuide.fileName} (${fastQuestionCount + 1}/${fastInterviewQuestionLimit})`,
+    `[wecom-kf] strict guide question from ${matchedJobGuide.fileName} (${fastQuestionCount + 1})`,
   );
   return {
     reply: question,
@@ -588,7 +578,7 @@ function getIdentityStatus({ candidateRecord, history, text, matchedJobGuide }) 
   const hasName = Boolean(
     candidateRecord?.name ||
     hasLikelyCandidateNameInText(text, matchedJobGuide) ||
-    hasLikelyCandidateNameInHistory(history, matchedJobGuide),
+    hasLikelyCandidateNameInIdentityReplies(history, matchedJobGuide),
   );
   return {
     complete: hasName && hasPosition,
@@ -636,17 +626,13 @@ function shouldFastSendGreeting(externalUserId) {
 }
 
 function hasAskedIdentityAndPosition(history) {
-  const normalizedHistory = normalizeQuestionText(
-    history
-      .filter((item) => item.role === "HR")
-      .map((item) => item.text)
-      .join("\n"),
-  );
-  return normalizedHistory.includes(normalizeQuestionText(identityAndPositionQuestion()));
+  return history.some((item) => item.role === "HR" && isIdentityQuestionText(item.text));
 }
 
 function hasLikelyCandidateNameInText(text, matchedJobGuide) {
-  let normalized = normalizeQuestionText(text);
+  const value = String(text || "").trim();
+  if (!value) return false;
+  let normalized = normalizeQuestionText(value);
   const guideForText = matchedJobGuide || findJobGuideInCandidateText(text);
   const matchedAliases = guideForText?.aliases || [];
   for (const alias of matchedAliases) {
@@ -656,12 +642,42 @@ function hasLikelyCandidateNameInText(text, matchedJobGuide) {
     /我叫|我是|本人|应聘|岗位|职位|求职|面试|销售岗|销售|项目策划岗|项目策划|策划岗|策划|岗|的/g,
     "",
   );
-  return normalized.length >= 2;
+  if (!normalized || /^(你好|您好|在吗|hi|hello)$/iu.test(normalized)) return false;
+  if (/^[\d零一二三四五六七八九十百千万年月天岁]+$/u.test(normalized)) return false;
+  if (
+    /(公司|资源|团队|实力|个人原因|离职|行业|互联网|销售|岗位|薪资|期望|已婚|未婚|小孩|孩子|老家|哪里|地铁|黄村|广东|广州|深圳|北京|上海)/u.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+  return /^[\p{Script=Han}A-Za-z·]{2,8}$/u.test(normalized);
 }
 
-function hasLikelyCandidateNameInHistory(history, matchedJobGuide) {
-  return history.some(
-    (item) => item.role !== "HR" && hasLikelyCandidateNameInText(item.text, matchedJobGuide),
+function hasLikelyCandidateNameInIdentityReplies(history, matchedJobGuide) {
+  const identityQuestionIndex = findLastIdentityQuestionIndex(history);
+  if (identityQuestionIndex < 0) return false;
+  return history
+    .slice(identityQuestionIndex + 1)
+    .some((item) => item.role !== "HR" && hasLikelyCandidateNameInText(item.text, matchedJobGuide));
+}
+
+function findLastIdentityQuestionIndex(history) {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const item = history[index];
+    if (item.role !== "HR") continue;
+    if (isIdentityQuestionText(item.text)) return index;
+  }
+  return -1;
+}
+
+function isIdentityQuestionText(text) {
+  const normalizedText = normalizeQuestionText(text);
+  return (
+    normalizedText.includes(normalizeQuestionText(identityAndPositionQuestion())) ||
+    normalizedText.includes("怎么称呼") ||
+    (normalizedText.includes("应聘") &&
+      (normalizedText.includes("岗位") || normalizedText.includes("职位")))
   );
 }
 
@@ -924,11 +940,12 @@ function buildReplyPrompt({ candidateRecord, matchedJobGuide, recentHistory, tex
     "1.5 同一个问题最多追问一次；如果 HR 已经围绕上一题追问过，候选人随后给了回答，就直接进入岗位文件里的下一题，除非上一题原文里还有另一个明确子问题完全未回答。",
     "1.6 候选人只要对当前问题有语义上的回答，即使很短，例如离职原因回答“个人原因”，也视为已回答；不要基于这个回答自行扩展新追问，例如不要追问之前几份工作每份做多久，除非当前问题原文本来就问了工作时长。",
     "1.7 追问只能补当前问题原文里缺失的必要部分，不能临时新增岗位文档或上一题都没有问的维度。",
+    "1.8 岗位文件原题如果已经用同义表达问过并且候选人答过，就视为已覆盖，不要再用原题重复问。例如“做过哪些行业/卖什么产品服务”已覆盖“呆过什么行业/主营业务产品”；“客户偏什么端/大C小C大B小B占比”已覆盖“客户构成及各类客户业绩占比”。",
+    "1.9 进入下一道岗位题时，必须复制具体岗位文档“题目：”里的原题原文，只去掉开头序号，不要润色、改写、同义替换、拆分或合并题目。比如原题是“4.客户资源如何来的？自拓还是公司给的资源？ 如果是自拓？自拓的渠道或者方法是？目前客户资源是在自己手上还是公司？ 月拜访客户跟成交客户分别是多少？”时，直接问去掉“4.”后的完整原题。",
     "2. 按不同求职者分别积累信息，并基于已知信息继续追问。",
     "2.1 候选人可能把姓名、岗位、当前状态拆成连续几条短消息发送；如果本次新消息、最近对话或已积累资料里已经出现姓名或岗位，不要再重复问。",
     "3. 每次只问一个核心问题，微信纯文本回复，不要使用 Markdown 样式符号。",
-    "3.1 如果 reply 里有两段且表达的是两层不同意思，中间用一个空行分隔，bridge 会分成两条微信消息发送。",
-    "3.1.1 如果一句回复里前半句是承接/结束上一话题，后半句是转入下一题，例如“这块先不展开了。继续——……？”，必须拆成两段，中间空一行。",
+    "3.1 岗位题不要拆成多条微信消息；一道岗位原题即使包含多个问号，也作为一条消息整体发送。",
     "3.2 不要写“他/她”“他（她）”“她/他”这种不自然的不确定式称呼；需要泛指负责人或面试官时，用“他”或直接写“负责人”。",
     "4. 收集到的信息不需要发给求职者汇总确认。",
     "4.1 不要总结、复述或确认候选人刚回答的内容；不要写“记下了”“收到”“了解了”“清楚了”“这块清楚了”“好的，已记录”“我这边记录一下”等承接语。",
@@ -1861,6 +1878,7 @@ function extractUncoveredGuideQuestions(content, historyText) {
 function isGuideQuestionCoveredByHistory(question, normalizedHistory) {
   return (
     isExactGuideQuestionInHistory(question, normalizedHistory) ||
+    isGuideQuestionTopicCoveredByHistory(question, normalizedHistory) ||
     isLocationQuestionCoveredByHistory(question, normalizedHistory) ||
     isFamilyQuestionCoveredByHistory(question, normalizedHistory)
   );
@@ -1880,6 +1898,28 @@ function isExactGuideQuestionInHistory(question, normalizedHistory) {
 
 function relaxQuestionText(value) {
   return String(value || "").replace(/那|方便|说下|说一下|了解下|了解一下|及|和|与/g, "");
+}
+
+function isGuideQuestionTopicCoveredByHistory(question, normalizedHistory) {
+  const normalizedQuestion = normalizeQuestionText(question);
+  if (!normalizedQuestion || !normalizedHistory) return false;
+
+  if (/行业/u.test(normalizedQuestion) && /(产品|业务|主营|服务)/u.test(normalizedQuestion)) {
+    return (
+      /(行业|呆过|待过|做过)/u.test(normalizedHistory) &&
+      /(产品|业务|主营|服务|卖什么)/u.test(normalizedHistory)
+    );
+  }
+
+  if (/(客户构成|客户业绩|占比|大c|小c|大b|小b|大g|小g)/u.test(normalizedQuestion)) {
+    return (
+      /(客户构成|客户主要|偏什么端|客户业绩|占比|大c|小c|大b|小b|大g|小g)/u.test(
+        normalizedHistory,
+      ) && /(客户|大c|小c|大b|小b|大g|小g)/u.test(normalizedHistory)
+    );
+  }
+
+  return false;
 }
 
 function isLocationQuestionCoveredByHistory(question, normalizedHistory) {
@@ -2074,7 +2114,6 @@ function splitOutboundReply(text, { reserveSlots = 0 } = {}) {
   const maxParts = Math.max(1, 5 - Number(reserveSlots || 0));
   const parts = cleaned
     .split(/\n\s*\n+/)
-    .flatMap(splitTransitionOutboundPart)
     .map((part) => part.trim())
     .filter(Boolean);
 
@@ -2082,24 +2121,6 @@ function splitOutboundReply(text, { reserveSlots = 0 } = {}) {
   if (parts.length <= maxParts) return parts;
 
   return [...parts.slice(0, maxParts - 1), parts.slice(maxParts - 1).join("\n\n")];
-}
-
-function splitTransitionOutboundPart(text) {
-  const value = String(text || "").trim();
-  if (!value) return [];
-
-  const match =
-    /^(?<lead>[\s\S]{2,120}?[。！？!?])\s*(?<next>(?:继续|接下来|下面|然后|再来|下一题|下一个问题)[—\-－:：，,、\s]*[\s\S]*[？?])$/u.exec(
-      value,
-    );
-  if (!match?.groups) return [value];
-
-  const lead = match.groups.lead.trim();
-  const next = match.groups.next
-    .replace(/^(?:继续|接下来|下面|然后|再来|下一题|下一个问题)[—\-－:：，,、\s]*/u, "")
-    .trim();
-
-  return lead && next ? [lead, next] : [value];
 }
 
 function randomReplyPartDelayMs() {
