@@ -641,18 +641,30 @@ function hasLikelyCandidateNameInText(text, matchedJobGuide) {
 }
 
 function hasLikelyCandidateNameInIdentityReplies(history, matchedJobGuide) {
-  const identityQuestionIndex = findLastIdentityQuestionIndex(history);
+  const identityQuestionIndex = findFirstOpenIdentityQuestionIndex(history);
   if (identityQuestionIndex < 0) return false;
   return history
     .slice(identityQuestionIndex + 1)
     .some((item) => item.role !== "HR" && hasLikelyCandidateNameInText(item.text, matchedJobGuide));
 }
 
-function findLastIdentityQuestionIndex(history) {
-  for (let index = history.length - 1; index >= 0; index -= 1) {
+function findFirstOpenIdentityQuestionIndex(history) {
+  const lastIntroIndex = findLastOpeningIntroIndex(history);
+  for (let index = lastIntroIndex + 1; index < history.length; index += 1) {
     const item = history[index];
     if (item.role !== "HR") continue;
     if (isIdentityQuestionText(item.text)) return index;
+  }
+  return -1;
+}
+
+function findLastOpeningIntroIndex(history) {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const item = history[index];
+    if (item.role !== "HR") continue;
+    if (normalizeQuestionText(item.text).includes(normalizeQuestionText(openingIntroMessage()))) {
+      return index;
+    }
   }
   return -1;
 }
