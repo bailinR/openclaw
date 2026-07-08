@@ -23,7 +23,12 @@ const port = Number(process.env.WECOM_KF_BRIDGE_PORT || 19088);
 const callbackPath = process.env.WECOM_KF_CALLBACK_PATH || "/wecom-kf";
 const agentId = process.env.OPENCLAW_JOBTEST_AGENT_ID || "job-agent";
 const intakeDelayMs = Number(process.env.WECOM_KF_INTAKE_DELAY_MS || 500);
-const replyPartDelayMs = Number(process.env.WECOM_KF_REPLY_PART_DELAY_MS || 2500);
+const replyPartDelayMinMs = Number(
+  process.env.WECOM_KF_REPLY_PART_DELAY_MIN_MS || process.env.WECOM_KF_REPLY_PART_DELAY_MS || 2000,
+);
+const replyPartDelayMaxMs = Number(
+  process.env.WECOM_KF_REPLY_PART_DELAY_MAX_MS || process.env.WECOM_KF_REPLY_PART_DELAY_MS || 6000,
+);
 const preSendRecheckMax = Number(process.env.WECOM_KF_PRE_SEND_RECHECK_MAX || 3);
 const openClawTimeoutMs = Number(process.env.OPENCLAW_JOBTEST_TIMEOUT_MS || 55000);
 const fastInterviewMode = process.env.WECOM_KF_FAST_INTERVIEW_MODE !== "0";
@@ -77,7 +82,7 @@ server.listen(port, "127.0.0.1", () => {
   log(`[wecom-kf] job overview file: ${jobOverviewPath}`);
   log(`[wecom-kf] job guide dir: ${jobGuidesDir} (${jobGuides.length} guide(s))`);
   log(
-    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; fast interview: ${fastInterviewMode ? "on" : "off"}; fast question limit: ${fastInterviewQuestionLimit}; identity followup delay: ${identityFollowupDelayMs}ms; async assessment: ${asyncAssessmentMode ? "on" : "off"}; async assessment timeout: ${asyncAssessmentTimeoutMs}ms; async assessment quiet: ${asyncAssessmentQuietMs}ms`,
+    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMinMs}-${replyPartDelayMaxMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; fast interview: ${fastInterviewMode ? "on" : "off"}; fast question limit: ${fastInterviewQuestionLimit}; identity followup delay: ${identityFollowupDelayMs}ms; async assessment: ${asyncAssessmentMode ? "on" : "off"}; async assessment timeout: ${asyncAssessmentTimeoutMs}ms; async assessment quiet: ${asyncAssessmentQuietMs}ms`,
   );
 });
 
@@ -323,7 +328,11 @@ async function processBatch(batch, { token }) {
     });
     try {
       for (let i = 0; i < outboundTexts.length; i += 1) {
-        if (i > 0) await sleep(replyPartDelayMs);
+        if (i > 0) {
+          const delayMs = randomReplyPartDelayMs();
+          log(`[wecom-kf] waiting ${delayMs}ms before reply part ${i + 1}`);
+          await sleep(delayMs);
+        }
         await sendText({
           openKfid: batch.openKfid,
           externalUserId: batch.externalUserId,
@@ -1617,6 +1626,12 @@ function splitOutboundReply(text, { reserveSlots = 0 } = {}) {
   if (parts.length <= maxParts) return parts;
 
   return [...parts.slice(0, maxParts - 1), parts.slice(maxParts - 1).join("\n\n")];
+}
+
+function randomReplyPartDelayMs() {
+  const min = Math.max(0, Math.min(replyPartDelayMinMs, replyPartDelayMaxMs));
+  const max = Math.max(min, replyPartDelayMinMs, replyPartDelayMaxMs);
+  return min + Math.floor(Math.random() * (max - min + 1));
 }
 
 function sanitizeOutboundText(text) {
