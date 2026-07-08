@@ -854,7 +854,6 @@ async function runOpenClaw({ externalUserId, text }) {
     } catch (err) {
       if (isTimeoutError(err)) {
         const fallbackReply = buildFastFallbackReply({
-          candidateRecord,
           matchedJobGuide,
           recentHistory,
           text,
@@ -1071,7 +1070,11 @@ async function runCandidateAssessment({ externalUserId, safeExternalUserId }) {
       );
       return;
     }
-    const candidateUpdate = parseCandidateUpdateReply(extractAgentJsonText(output));
+    const candidateUpdate = normalizeCandidateUpdateQuestions({
+      candidateUpdate: parseCandidateUpdateReply(extractAgentJsonText(output)),
+      matchedJobGuide,
+      recentHistory,
+    });
     if (!candidateUpdate) {
       log("[wecom-kf] async assessment returned no candidate_update");
       return;
@@ -1123,7 +1126,8 @@ function buildAssessmentPrompt({ candidateRecord, matchedJobGuide, recentHistory
     "3. 根据候选人应聘岗位和岗位评分标准持续更新评分、加减分和内部简评。",
     "4. 如果岗位文件中的某个问题已经由通用开场问题覆盖，例如哪里人、住哪里、最近薪资、期望薪资，就直接基于回答评分，不要认为缺失。",
     "5. candidate_questions 只记录候选人主动问过、需要面试官解答的问题。",
-    "6. next_missing_info 只放后续仍需追问的关键信息，避免重复已经问过且已回答的信息。",
+    "6. next_missing_info 只能放具体岗位文档“题目：”中的原始问题原文；不要放字段名、概括版问题、润色后的客服话术或自行扩展的问题。",
+    "7. 如果岗位原题发送时需要拆成多条或改得更口语，由微信回复任务处理；candidate_update 里必须保留岗位文档原题。",
     "",
     "具体岗位文档：",
     matchedJobGuide
@@ -1173,7 +1177,7 @@ function buildCandidateUpdateTemplate() {
       salary_expectation: "薪资期望或薪酬结构，未知填 null",
     },
     candidate_questions: ["候选人问过、需要面试官解答的问题"],
-    next_missing_info: ["后续还需要补充了解的信息"],
+    next_missing_info: ["具体岗位文档“题目：”中的原始问题原文；不要改写、概括或自创"],
     assessment: {
       score: "0-100 的数字；信息不足时也要基于已知信息给暂定分",
       level: "信息不足/需谨慎/基本匹配/较匹配/优秀",
@@ -1200,6 +1204,20 @@ function parseCandidateUpdateReply(rawText) {
   return candidateUpdate && typeof candidateUpdate === "object" && !Array.isArray(candidateUpdate)
     ? candidateUpdate
     : null;
+}
+
+function normalizeCandidateUpdateQuestions({ candidateUpdate, matchedJobGuide, recentHistory }) {
+  if (!candidateUpdate || typeof candidateUpdate !== "object" || Array.isArray(candidateUpdate)) {
+    return candidateUpdate;
+  }
+
+  const next = { ...candidateUpdate };
+  if (matchedJobGuide?.content) {
+    next.next_missing_info = extractUncoveredGuideQuestions(matchedJobGuide.content, recentHistory);
+  } else if (Array.isArray(next.next_missing_info)) {
+    next.next_missing_info = [];
+  }
+  return next;
 }
 
 function buildBatchText(items, { beforeSendRegeneration = false } = {}) {
@@ -1568,17 +1586,7 @@ function isTimeoutError(err) {
   );
 }
 
-function buildFastFallbackReply({ candidateRecord, matchedJobGuide, recentHistory, text }) {
-  const missing = Array.isArray(candidateRecord?.next_missing_info)
-    ? candidateRecord.next_missing_info.find(
-        (item) =>
-          typeof item === "string" &&
-          item.trim() &&
-          !shouldReviewRepeatedQuestion(item, recentHistory, text),
-      )
-    : "";
-  if (missing) return questionFromText(missing);
-
+function buildFastFallbackReply({ matchedJobGuide, recentHistory, text }) {
   const historyText = [recentHistory, text].filter(Boolean).join("\n");
   const guideQuestion = matchedJobGuide
     ? pickNextGuideQuestion(matchedJobGuide.content, historyText)
@@ -1826,13 +1834,6 @@ function recentHrAskedChildDetails(recentHistory) {
   return lines.some((line) => line.startsWith("HR：") && replyAsksChildDetails(line));
 }
 
-function questionFromText(value) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  if (/[？?]$/u.test(text)) return text;
-  return `那方便说下${text}？`;
-}
-
 function pickNextGuideQuestion(content, historyText) {
   const questions = extractGuideQuestions(content);
   const normalizedHistory = normalizeQuestionText(historyText);
@@ -1848,6 +1849,13 @@ function countAskedGuideQuestions(content, historyText) {
   return extractGuideQuestions(content).filter((question) =>
     isExactGuideQuestionInHistory(question, normalizedHistory),
   ).length;
+}
+
+function extractUncoveredGuideQuestions(content, historyText) {
+  const normalizedHistory = normalizeQuestionText(historyText);
+  return extractGuideQuestions(content).filter(
+    (question) => !isGuideQuestionCoveredByHistory(question, normalizedHistory),
+  );
 }
 
 function isGuideQuestionCoveredByHistory(question, normalizedHistory) {
@@ -2009,7 +2017,13 @@ function writeJsonFileAtomic(filePath, value) {
 
 function mergeCandidateRecord(current, update) {
   if (!update || typeof update !== "object" || Array.isArray(update)) return current || {};
-  return deepMerge(current || {}, update);
+  const merged = deepMerge(current || {}, update);
+  if (Object.prototype.hasOwnProperty.call(update, "next_missing_info")) {
+    merged.next_missing_info = Array.isArray(update.next_missing_info)
+      ? update.next_missing_info
+      : [];
+  }
+  return merged;
 }
 
 function deepMerge(base, update) {
