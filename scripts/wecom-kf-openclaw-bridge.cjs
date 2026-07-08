@@ -732,6 +732,12 @@ async function judgeCandidateAnswerSufficiency({
     "next_question_if_answered:",
     nextQuestion || "",
     "",
+    "Additional hard rules:",
+    "- A question can be followed up at most once. If recent_history shows HR already asked a follow-up for current_question and the candidate then replied, action=answered unless another explicit sub-question from current_question is still unanswered.",
+    '- If candidate_message is semantically responsive to current_question, even if it is short like "personal reason", action=answered. Do not invent new follow-up dimensions from the answer.',
+    "- Only follow up for an explicit missing part of current_question. Do not ask about tenure, duration, family details, salary, location, or other extra details unless current_question itself asked for them.",
+    "- If action=answered, the caller will send next_question_if_answered. Do not put summaries or acknowledgements in reply.",
+    "",
     "matched_job_file:",
     matchedJobGuide ? `${matchedJobGuide.fileName}\n${matchedJobGuide.content}` : "未匹配",
   ].join("\n");
@@ -916,10 +922,14 @@ function buildReplyPrompt({ candidateRecord, matchedJobGuide, recentHistory, tex
     "1.2 如果上一题是复合问题，候选人只回答了其中一部分，只追问缺失且必要的一个核心点；例如问已婚未婚、有没有小孩，候选人只答“已婚”，才追问有没有小孩。",
     "1.3 如果问题是居住地、区域、附近地铁站，候选人回答“黄村”“白云”“天河客运站”等地点短语，应视为已回答，不要为了确认是区域还是地铁站继续追问。",
     "1.4 如果候选人已经表示没有小孩、问题与岗位无关或不愿回答家庭隐私，不要继续追问小孩几个、多大、谁带、配偶在哪等家庭问题，直接进入下一个岗位题。",
+    "1.5 同一个问题最多追问一次；如果 HR 已经围绕上一题追问过，候选人随后给了回答，就直接进入岗位文件里的下一题，除非上一题原文里还有另一个明确子问题完全未回答。",
+    "1.6 候选人只要对当前问题有语义上的回答，即使很短，例如离职原因回答“个人原因”，也视为已回答；不要基于这个回答自行扩展新追问，例如不要追问之前几份工作每份做多久，除非当前问题原文本来就问了工作时长。",
+    "1.7 追问只能补当前问题原文里缺失的必要部分，不能临时新增岗位文档或上一题都没有问的维度。",
     "2. 按不同求职者分别积累信息，并基于已知信息继续追问。",
     "2.1 候选人可能把姓名、岗位、当前状态拆成连续几条短消息发送；如果本次新消息、最近对话或已积累资料里已经出现姓名或岗位，不要再重复问。",
     "3. 每次只问一个核心问题，微信纯文本回复，不要使用 Markdown 样式符号。",
     "3.1 如果 reply 里有两段且表达的是两层不同意思，中间用一个空行分隔，bridge 会分成两条微信消息发送。",
+    "3.1.1 如果一句回复里前半句是承接/结束上一话题，后半句是转入下一题，例如“这块先不展开了。继续——……？”，必须拆成两段，中间空一行。",
     "3.2 不要写“他/她”“他（她）”“她/他”这种不自然的不确定式称呼；需要泛指负责人或面试官时，用“他”或直接写“负责人”。",
     "4. 收集到的信息不需要发给求职者汇总确认。",
     "4.1 不要总结、复述或确认候选人刚回答的内容；不要写“记下了”“收到”“了解了”“清楚了”“这块清楚了”“好的，已记录”“我这边记录一下”等承接语。",
@@ -2050,6 +2060,7 @@ function splitOutboundReply(text, { reserveSlots = 0 } = {}) {
   const maxParts = Math.max(1, 5 - Number(reserveSlots || 0));
   const parts = cleaned
     .split(/\n\s*\n+/)
+    .flatMap(splitTransitionOutboundPart)
     .map((part) => part.trim())
     .filter(Boolean);
 
@@ -2057,6 +2068,24 @@ function splitOutboundReply(text, { reserveSlots = 0 } = {}) {
   if (parts.length <= maxParts) return parts;
 
   return [...parts.slice(0, maxParts - 1), parts.slice(maxParts - 1).join("\n\n")];
+}
+
+function splitTransitionOutboundPart(text) {
+  const value = String(text || "").trim();
+  if (!value) return [];
+
+  const match =
+    /^(?<lead>[\s\S]{2,120}?[。！？!?])\s*(?<next>(?:继续|接下来|下面|然后|再来|下一题|下一个问题)[—\-－:：，,、\s]*[\s\S]*[？?])$/u.exec(
+      value,
+    );
+  if (!match?.groups) return [value];
+
+  const lead = match.groups.lead.trim();
+  const next = match.groups.next
+    .replace(/^(?:继续|接下来|下面|然后|再来|下一题|下一个问题)[—\-－:：，,、\s]*/u, "")
+    .trim();
+
+  return lead && next ? [lead, next] : [value];
 }
 
 function randomReplyPartDelayMs() {
