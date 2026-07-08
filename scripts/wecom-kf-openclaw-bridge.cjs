@@ -38,6 +38,8 @@ const identityFollowupDelayMs = Number(process.env.WECOM_KF_IDENTITY_FOLLOWUP_DE
 const asyncAssessmentMode = process.env.WECOM_KF_ASYNC_ASSESSMENT_MODE !== "0";
 const asyncAssessmentTimeoutMs = Number(process.env.WECOM_KF_ASYNC_ASSESSMENT_TIMEOUT_MS || 90000);
 const asyncAssessmentQuietMs = Number(process.env.WECOM_KF_ASYNC_ASSESSMENT_QUIET_MS || 5000);
+const interviewSupplementPrompt =
+  process.env.WECOM_KF_INTERVIEW_SUPPLEMENT_PROMPT || "您还有什么要补充的吗？";
 const interviewCompleteMessage =
   process.env.WECOM_KF_INTERVIEW_COMPLETE_MESSAGE ||
   "感谢您的配合，后续我们会进行一个综合评估，如果进入复试，有消息会第一时间联系您。";
@@ -486,11 +488,22 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode })
     if (hasCompletedGuide(candidateRecord, matchedJobGuide.fileName)) {
       return { reply: "NO_REPLY", actions: {}, candidateUpdate: null };
     }
+    if (hasPromptedInterviewSupplement(candidateRecord, matchedJobGuide.fileName)) {
+      if (!hasCandidateRepliedAfterInterviewSupplement(history)) {
+        return { reply: "NO_REPLY", actions: {}, candidateUpdate: null };
+      }
+      log(`[wecom-kf] strict guide interview completed for ${matchedJobGuide.fileName}`);
+      return {
+        reply: interviewCompleteMessage,
+        actions: {},
+        candidateUpdate: buildGuideCompleteCandidateUpdate({ matchedJobGuide }),
+      };
+    }
     log(`[wecom-kf] strict guide interview completed for ${matchedJobGuide.fileName}`);
     return {
-      reply: interviewCompleteMessage,
+      reply: interviewSupplementPrompt,
       actions: {},
-      candidateUpdate: buildGuideCompleteCandidateUpdate({ matchedJobGuide }),
+      candidateUpdate: buildInterviewSupplementPromptCandidateUpdate({ matchedJobGuide }),
     };
   }
 
@@ -552,8 +565,33 @@ function buildGuideCompleteCandidateUpdate({ matchedJobGuide }) {
   };
 }
 
+function buildInterviewSupplementPromptCandidateUpdate({ matchedJobGuide }) {
+  return {
+    position: positionFromGuideFile(matchedJobGuide.fileName),
+    stage: "待候选人补充",
+    interview_final_prompted: {
+      [matchedJobGuide.fileName]: true,
+    },
+  };
+}
+
 function hasCompletedGuide(candidateRecord, guideFileName) {
   return Boolean(candidateRecord?.guide_completed?.[guideFileName]);
+}
+
+function hasPromptedInterviewSupplement(candidateRecord, guideFileName) {
+  return Boolean(candidateRecord?.interview_final_prompted?.[guideFileName]);
+}
+
+function hasCandidateRepliedAfterInterviewSupplement(history) {
+  const normalizedPrompt = normalizeQuestionText(interviewSupplementPrompt);
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const item = history[index];
+    if (item.role !== "HR") continue;
+    if (!normalizeQuestionText(item.text).includes(normalizedPrompt)) continue;
+    return history.slice(index + 1).some((entry) => entry.role !== "HR");
+  }
+  return false;
 }
 
 function positionFromGuideFile(fileName) {
