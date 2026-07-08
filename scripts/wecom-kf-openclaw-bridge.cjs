@@ -31,6 +31,7 @@ const replyPartDelayMaxMs = Number(
 );
 const preSendRecheckMax = Number(process.env.WECOM_KF_PRE_SEND_RECHECK_MAX || 3);
 const openClawTimeoutMs = Number(process.env.OPENCLAW_JOBTEST_TIMEOUT_MS || 55000);
+const replyJudgeTimeoutMs = Number(process.env.WECOM_KF_REPLY_JUDGE_TIMEOUT_MS || 20000);
 const fastInterviewMode = process.env.WECOM_KF_FAST_INTERVIEW_MODE !== "0";
 const fastInterviewQuestionLimit = Number(process.env.WECOM_KF_FAST_INTERVIEW_QUESTION_LIMIT || 3);
 const identityFollowupDelayMs = Number(process.env.WECOM_KF_IDENTITY_FOLLOWUP_DELAY_MS || 60000);
@@ -82,7 +83,7 @@ server.listen(port, "127.0.0.1", () => {
   log(`[wecom-kf] job overview file: ${jobOverviewPath}`);
   log(`[wecom-kf] job guide dir: ${jobGuidesDir} (${jobGuides.length} guide(s))`);
   log(
-    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMinMs}-${replyPartDelayMaxMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; fast interview: ${fastInterviewMode ? "on" : "off"}; fast question limit: ${fastInterviewQuestionLimit}; identity followup delay: ${identityFollowupDelayMs}ms; async assessment: ${asyncAssessmentMode ? "on" : "off"}; async assessment timeout: ${asyncAssessmentTimeoutMs}ms; async assessment quiet: ${asyncAssessmentQuietMs}ms`,
+    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMinMs}-${replyPartDelayMaxMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; reply judge timeout: ${replyJudgeTimeoutMs}ms; fast interview: ${fastInterviewMode ? "on" : "off"}; fast question limit: ${fastInterviewQuestionLimit}; identity followup delay: ${identityFollowupDelayMs}ms; async assessment: ${asyncAssessmentMode ? "on" : "off"}; async assessment timeout: ${asyncAssessmentTimeoutMs}ms; async assessment quiet: ${asyncAssessmentQuietMs}ms`,
   );
 });
 
@@ -317,7 +318,11 @@ async function processBatch(batch, { token }) {
     return;
   }
 
-  const reply = agentResult.reply || "";
+  const reply = await rewriteContradictoryPersonalFollowup({
+    externalUserId: batch.externalUserId,
+    reply: agentResult.reply || "",
+    text,
+  });
   const actions = agentResult.actions || {};
   let sentReply = false;
   let sentReplyParts = [];
@@ -1399,7 +1404,12 @@ function isTimeoutError(err) {
 
 function buildFastFallbackReply({ candidateRecord, matchedJobGuide, recentHistory, text }) {
   const missing = Array.isArray(candidateRecord?.next_missing_info)
-    ? candidateRecord.next_missing_info.find((item) => typeof item === "string" && item.trim())
+    ? candidateRecord.next_missing_info.find(
+        (item) =>
+          typeof item === "string" &&
+          item.trim() &&
+          !shouldReviewRepeatedQuestion(item, recentHistory, text),
+      )
     : "";
   if (missing) return questionFromText(missing);
 
@@ -1410,6 +1420,218 @@ function buildFastFallbackReply({ candidateRecord, matchedJobGuide, recentHistor
   if (guideQuestion) return guideQuestion;
 
   return "你应聘的是哪个岗位？";
+}
+
+async function rewriteContradictoryPersonalFollowup({ externalUserId, reply, text }) {
+  const value = String(reply || "").trim();
+  if (!value || /^NO_REPLY$/i.test(value)) return value;
+
+  const safeExternalUserId = safeId(externalUserId);
+  const history = loadCandidateHistory(safeExternalUserId);
+  const recentHistory = history
+    .slice(-30)
+    .map((item) => `${item.role}：${item.text}`)
+    .join("\n");
+  const historyText = [recentHistory, text].filter(Boolean).join("\n");
+  const candidateRecord = loadCandidateRecord(safeExternalUserId);
+  const matchedJobGuide = selectJobGuide({
+    candidateRecord,
+    recentHistory,
+    text,
+  });
+
+  if (!shouldReviewRepeatedQuestion(value, recentHistory, text)) return value;
+
+  const nextQuestion = matchedJobGuide
+    ? pickNextGuideQuestion(matchedJobGuide.content, historyText)
+    : "";
+  const decision = await judgeReplyAgainstRecentAnswers({
+    recentHistory,
+    candidateMessage: text,
+    proposedReply: value,
+    nextQuestion,
+  });
+
+  if (decision.action === "replace" && decision.reply) {
+    log("[wecom-kf] model replaced repeated/answered followup");
+    return decision.reply;
+  }
+  if (decision.action === "suppress") {
+    log("[wecom-kf] model suppressed repeated/answered followup");
+    return "NO_REPLY";
+  }
+  return value;
+}
+
+function shouldReviewRepeatedQuestion(question, recentHistory, text) {
+  const value = String(question || "");
+  if (!value) return false;
+  const combined = [recentHistory, text].filter(Boolean).join("\n");
+  const normalizedCombined = normalizeQuestionText(combined);
+  if (hasMultipleQuestionMarks(value)) return true;
+  if (replyAsksChildDetails(value) && indicatesNoChildren({ recentHistory, text })) return true;
+  if (replyAsksFamilyPersonal(value) && indicatesFamilyPushback({ recentHistory, text }))
+    return true;
+  return (
+    isFamilyQuestionCoveredByHistory(value, normalizedCombined) && replyAsksFamilyPersonal(value)
+  );
+}
+
+async function judgeReplyAgainstRecentAnswers({
+  recentHistory,
+  candidateMessage,
+  proposedReply,
+  nextQuestion,
+}) {
+  const messagePath = path.join(
+    stateDir,
+    `judge-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.txt`,
+  );
+  const prompt = [
+    "你是企业微信招聘面试回复质检器。",
+    "只判断 proposed_reply 是否在重复追问候选人已经回答过的问题，或没有理解候选人刚才的意思。",
+    "必须只输出合法 JSON，不要 Markdown，不要额外文字。",
+    "",
+    "判断原则：",
+    "1. 如果候选人已经明确回答了某个问题，proposed_reply 还在继续问同一个意思，action=replace 或 suppress。",
+    "2. 如果候选人说没有小孩/没孩子，继续问几个、多大、谁带属于重复追问。",
+    "3. 如果候选人表示问题和岗位无关或不愿回答家庭隐私，继续追问家庭/婚育/配偶属于重复追问。",
+    "4. 如果 proposed_reply 合理追问尚未回答的关键信息，action=send。",
+    "5. 如果需要替换，优先使用 next_question；如果 next_question 也不合适，action=suppress。",
+    "",
+    "JSON 输出格式：",
+    JSON.stringify(
+      {
+        action: "send | replace | suppress",
+        reply: "action=replace 时填写要发送的新问题，否则填空字符串",
+        reason: "简短说明，内部日志用，不发给候选人",
+      },
+      null,
+      2,
+    ),
+    "",
+    "recent_history:",
+    recentHistory || "暂无",
+    "",
+    "candidate_message:",
+    candidateMessage || "",
+    "",
+    "proposed_reply:",
+    proposedReply || "",
+    "",
+    "next_question:",
+    nextQuestion || "",
+  ].join("\n");
+
+  fs.writeFileSync(messagePath, prompt, "utf8");
+
+  const args = [
+    "scripts/run-node.mjs",
+    "--dev",
+    "agent",
+    "--agent",
+    agentId,
+    "--local",
+    "--session-key",
+    `agent:${agentId}:wecom-kf-reply-judge`,
+    "--message-file",
+    messagePath,
+    "--json",
+    "--timeout",
+    String(Math.ceil(replyJudgeTimeoutMs / 1000)),
+  ];
+
+  try {
+    const output = await execFile(process.execPath, args, {
+      cwd: rootDir,
+      env: process.env,
+      timeout: replyJudgeTimeoutMs,
+    });
+    return normalizeReplyJudgeDecision(extractAgentJsonText(output), nextQuestion);
+  } catch (err) {
+    log(`[wecom-kf] reply judge failed; falling back to next question: ${err.message || err}`);
+    return buildReplyJudgeFallback(nextQuestion);
+  } finally {
+    try {
+      fs.unlinkSync(messagePath);
+    } catch {}
+  }
+}
+
+function buildReplyJudgeFallback(nextQuestion) {
+  const reply = nextQuestion ? `好的\n\n${nextQuestion}` : "好的";
+  return { action: "replace", reply, reason: "judge failed" };
+}
+
+function normalizeReplyJudgeDecision(rawText, nextQuestion) {
+  const parsed =
+    tryParseJsonObject(stripMarkdownJsonFence(rawText)) ||
+    tryParseJsonObject(extractJsonObject(rawText)) ||
+    {};
+  const action = String(parsed.action || "").toLowerCase();
+  if (action === "replace") {
+    const reply = String(parsed.reply || nextQuestion || "").trim();
+    return reply
+      ? { action: "replace", reply, reason: String(parsed.reason || "") }
+      : { action: "suppress", reply: "", reason: String(parsed.reason || "") };
+  }
+  if (action === "suppress") {
+    return { action: "suppress", reply: "", reason: String(parsed.reason || "") };
+  }
+  return { action: "send", reply: "", reason: String(parsed.reason || "") };
+}
+
+function hasMultipleQuestionMarks(value) {
+  const matches = String(value || "").match(/[？?]/g);
+  return Boolean(matches && matches.length >= 2);
+}
+
+function replyAsksChildDetails(value) {
+  return (
+    /(小孩|孩子|娃|宝宝)/u.test(value) && /(几个|几岁|多大|谁带|情况|有没有|有几个)/u.test(value)
+  );
+}
+
+function replyAsksFamilyPersonal(value) {
+  return /(家庭|结婚|婚育|小孩|孩子|老公|配偶|老婆|对象)/u.test(value);
+}
+
+function indicatesNoChildren({ recentHistory, text }) {
+  const normalizedText = normalizeQuestionText(text);
+  const normalizedHistory = normalizeQuestionText(recentHistory);
+  if (/(没有小孩|没小孩|无小孩|没有孩子|没孩子|无孩子|没有娃|没娃|无娃)/u.test(normalizedText)) {
+    return true;
+  }
+  if (
+    /^(没有|没|无|暂无|暂时没有)$/u.test(normalizedText) &&
+    recentHrAskedChildDetails(recentHistory)
+  ) {
+    return true;
+  }
+  return /(没有小孩|没小孩|无小孩|没有孩子|没孩子|无孩子|没有娃|没娃|无娃)/u.test(
+    normalizedHistory,
+  );
+}
+
+function indicatesFamilyPushback({ recentHistory, text }) {
+  const normalizedText = normalizeQuestionText(text);
+  if (
+    !/(岗位无关|和岗位无关|跟岗位无关|这个岗位无关|无关吧|不相关|不方便|隐私)/u.test(normalizedText)
+  ) {
+    return false;
+  }
+  return (
+    replyAsksFamilyPersonal(recentHistory) ||
+    /(家庭|小孩|孩子|老公|配偶|婚育)/u.test(normalizedText)
+  );
+}
+
+function recentHrAskedChildDetails(recentHistory) {
+  const lines = String(recentHistory || "")
+    .split(/\r\n|\n|\r/u)
+    .reverse()
+    .slice(0, 6);
+  return lines.some((line) => line.startsWith("HR：") && replyAsksChildDetails(line));
 }
 
 function questionFromText(value) {
@@ -1437,7 +1659,10 @@ function countAskedGuideQuestions(content, historyText) {
 }
 
 function isGuideQuestionCoveredByHistory(question, normalizedHistory) {
-  return isExactGuideQuestionInHistory(question, normalizedHistory);
+  return (
+    isExactGuideQuestionInHistory(question, normalizedHistory) ||
+    isFamilyQuestionCoveredByHistory(question, normalizedHistory)
+  );
 }
 
 function isExactGuideQuestionInHistory(question, normalizedHistory) {
@@ -1445,6 +1670,15 @@ function isExactGuideQuestionInHistory(question, normalizedHistory) {
   if (!normalizedQuestion) return false;
   const probe = normalizedQuestion.slice(0, Math.min(12, normalizedQuestion.length));
   return normalizedHistory.includes(probe);
+}
+
+function isFamilyQuestionCoveredByHistory(question, normalizedHistory) {
+  if (!/(家庭|结婚|婚育|小孩|孩子|老公|配偶)/u.test(question)) return false;
+  return (
+    /(没有小孩|没小孩|无小孩|没有孩子|没孩子|无孩子|没有娃|没娃|无娃)/u.test(normalizedHistory) ||
+    /(小孩|孩子|娃|宝宝).{0,80}(没有|没|无|暂无|暂时没有)/u.test(normalizedHistory) ||
+    /(岗位无关|和岗位无关|跟岗位无关|这个岗位无关|无关吧|不相关|不方便)/u.test(normalizedHistory)
+  );
 }
 
 function hasSentOpeningIntro(history) {
