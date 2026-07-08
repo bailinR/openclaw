@@ -475,9 +475,10 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode })
   }
 
   const historyText = [recentHistory, text].filter(Boolean).join("\n");
-  const fastQuestionCount = countAskedGuideQuestions(matchedJobGuide.content, historyText);
+  const askedGuideQuestions = getAskedGuideQuestions(candidateRecord, matchedJobGuide.fileName);
+  const fastQuestionCount = askedGuideQuestions.length;
 
-  const question = pickNextGuideQuestion(matchedJobGuide.content, historyText);
+  const question = pickNextGuideQuestion(matchedJobGuide.content, historyText, askedGuideQuestions);
   if (!question) return null;
 
   if (!hasSentOpeningIntro(history) && !identityStatus.complete) {
@@ -485,7 +486,7 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode })
     return {
       reply: "NO_REPLY",
       actions: { scheduleIdentityFollowup: true },
-      candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
+      candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide, askedQuestion: null }),
     };
   }
 
@@ -496,7 +497,7 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode })
     return {
       reply: `好的\n\n${openingIntroMessage()}\n\n${question}`,
       actions: {},
-      candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
+      candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide, askedQuestion: question }),
     };
   }
 
@@ -507,7 +508,7 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode })
     return {
       reply: question,
       actions: {},
-      candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
+      candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide, askedQuestion: question }),
     };
   }
 
@@ -515,11 +516,17 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode })
   return null;
 }
 
-function buildFastCandidateUpdate({ matchedJobGuide }) {
-  return {
+function buildFastCandidateUpdate({ matchedJobGuide, askedQuestion }) {
+  const update = {
     position: positionFromGuideFile(matchedJobGuide.fileName),
     stage: "初筛中",
   };
+  if (askedQuestion) {
+    update.asked_guide_questions = {
+      [matchedJobGuide.fileName]: [askedQuestion],
+    };
+  }
+  return update;
 }
 
 function positionFromGuideFile(fileName) {
@@ -849,6 +856,7 @@ async function runOpenClaw({ externalUserId, text }) {
     } catch (err) {
       if (isTimeoutError(err)) {
         const fallbackReply = buildFastFallbackReply({
+          candidateRecord,
           matchedJobGuide,
           recentHistory,
           text,
@@ -856,7 +864,17 @@ async function runOpenClaw({ externalUserId, text }) {
         log(
           `[wecom-kf] OpenClaw timed out after ${openClawTimeoutMs}ms; using fast fallback reply`,
         );
-        return { reply: fallbackReply, actions: {}, candidateUpdate: null };
+        return {
+          reply: fallbackReply,
+          actions: {},
+          candidateUpdate:
+            matchedJobGuide && fallbackReply
+              ? buildFastCandidateUpdate({
+                  matchedJobGuide,
+                  askedQuestion: fallbackReply,
+                })
+              : null,
+        };
       }
       throw err;
     }
@@ -1582,10 +1600,13 @@ function isTimeoutError(err) {
   );
 }
 
-function buildFastFallbackReply({ matchedJobGuide, recentHistory, text }) {
+function buildFastFallbackReply({ candidateRecord, matchedJobGuide, recentHistory, text }) {
   const historyText = [recentHistory, text].filter(Boolean).join("\n");
+  const askedGuideQuestions = matchedJobGuide
+    ? getAskedGuideQuestions(candidateRecord, matchedJobGuide.fileName)
+    : [];
   const guideQuestion = matchedJobGuide
-    ? pickNextGuideQuestion(matchedJobGuide.content, historyText)
+    ? pickNextGuideQuestion(matchedJobGuide.content, historyText, askedGuideQuestions)
     : "";
   if (guideQuestion) return guideQuestion;
 
@@ -1613,8 +1634,11 @@ async function rewriteContradictoryPersonalFollowup({ externalUserId, reply, tex
 
   if (!shouldReviewRepeatedQuestion(value, recentHistory, text)) return value;
 
+  const askedGuideQuestions = matchedJobGuide
+    ? getAskedGuideQuestions(candidateRecord, matchedJobGuide.fileName)
+    : [];
   const nextQuestion = matchedJobGuide
-    ? pickNextGuideQuestion(matchedJobGuide.content, historyText)
+    ? pickNextGuideQuestion(matchedJobGuide.content, historyText, askedGuideQuestions)
     : "";
   const decision = await judgeReplyAgainstRecentAnswers({
     recentHistory,
@@ -1830,11 +1854,17 @@ function recentHrAskedChildDetails(recentHistory) {
   return lines.some((line) => line.startsWith("HR：") && replyAsksChildDetails(line));
 }
 
-function pickNextGuideQuestion(content, historyText) {
+function pickNextGuideQuestion(content, historyText, askedQuestions = []) {
   const questions = extractGuideQuestions(content);
   const normalizedHistory = normalizeQuestionText(historyText);
+  const askedQuestionSet = new Set(
+    (Array.isArray(askedQuestions) ? askedQuestions : [])
+      .map((question) => normalizeQuestionText(question))
+      .filter(Boolean),
+  );
   return (
     questions.find((question) => {
+      if (askedQuestionSet.has(normalizeQuestionText(question))) return false;
       return !isGuideQuestionCoveredByHistory(question, normalizedHistory);
     }) || ""
   );
@@ -1965,6 +1995,13 @@ function normalizeQuestionText(value) {
     .replace(/[^\p{Letter}\p{Number}]+/gu, "");
 }
 
+function getAskedGuideQuestions(candidateRecord, guideFileName) {
+  const byGuide = candidateRecord?.asked_guide_questions;
+  const questions =
+    byGuide && typeof byGuide === "object" && !Array.isArray(byGuide) ? byGuide[guideFileName] : [];
+  return Array.isArray(questions) ? questions.filter((item) => typeof item === "string") : [];
+}
+
 function loadCandidateRecord(safeExternalUserId) {
   const assessments = loadCandidateAssessments();
   return assessments.candidates && typeof assessments.candidates === "object"
@@ -2012,6 +2049,10 @@ function saveCandidateRecord({
       : {};
   const now = new Date().toISOString();
   const next = mergeCandidateRecord(current, update);
+  backfillAskedGuideQuestionsFromHistory({
+    record: next,
+    safeExternalUserId,
+  });
 
   next.externalUserId = externalUserId;
   next.safeId = safeExternalUserId;
@@ -2042,7 +2083,73 @@ function mergeCandidateRecord(current, update) {
       ? update.next_missing_info
       : [];
   }
+  if (Object.prototype.hasOwnProperty.call(update, "asked_guide_questions")) {
+    merged.asked_guide_questions = mergeAskedGuideQuestions(
+      current?.asked_guide_questions,
+      update.asked_guide_questions,
+    );
+  }
   return merged;
+}
+
+function mergeAskedGuideQuestions(current, update) {
+  const result =
+    current && typeof current === "object" && !Array.isArray(current) ? { ...current } : {};
+  if (!update || typeof update !== "object" || Array.isArray(update)) return result;
+
+  for (const [guideFileName, questions] of Object.entries(update)) {
+    const existing = Array.isArray(result[guideFileName]) ? result[guideFileName] : [];
+    const additions = Array.isArray(questions) ? questions : [];
+    const seen = new Set();
+    result[guideFileName] = [...existing, ...additions]
+      .filter((question) => typeof question === "string" && question.trim())
+      .filter((question) => {
+        const key = normalizeQuestionText(question);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }
+
+  return result;
+}
+
+function backfillAskedGuideQuestionsFromHistory({ record, safeExternalUserId }) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return;
+  const history = loadCandidateHistory(safeExternalUserId);
+  if (history.length === 0) return;
+
+  const currentByGuide =
+    record.asked_guide_questions &&
+    typeof record.asked_guide_questions === "object" &&
+    !Array.isArray(record.asked_guide_questions)
+      ? record.asked_guide_questions
+      : {};
+  let nextByGuide = currentByGuide;
+
+  for (const guide of jobGuides) {
+    const asked = new Set(
+      getAskedGuideQuestions(record, guide.fileName).map(normalizeQuestionText),
+    );
+    const guideQuestions = extractGuideQuestions(guide.content);
+    const sentHrQuestions = history
+      .filter((item) => item.role === "HR")
+      .map((item) => String(item.text || ""));
+    const additions = guideQuestions.filter((question) => {
+      const normalizedQuestion = normalizeQuestionText(question);
+      if (!normalizedQuestion || asked.has(normalizedQuestion)) return false;
+      return sentHrQuestions.some((sent) =>
+        normalizeQuestionText(sent).includes(normalizedQuestion),
+      );
+    });
+    if (additions.length === 0) continue;
+
+    nextByGuide = mergeAskedGuideQuestions(nextByGuide, {
+      [guide.fileName]: additions,
+    });
+  }
+
+  record.asked_guide_questions = nextByGuide;
 }
 
 function deepMerge(base, update) {
