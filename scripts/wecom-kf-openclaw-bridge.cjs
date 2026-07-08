@@ -33,6 +33,7 @@ const preSendRecheckMax = Number(process.env.WECOM_KF_PRE_SEND_RECHECK_MAX || 3)
 const openClawTimeoutMs = Number(process.env.OPENCLAW_JOBTEST_TIMEOUT_MS || 55000);
 const replyJudgeEnabled = process.env.WECOM_KF_REPLY_JUDGE_MODE === "1";
 const replyJudgeTimeoutMs = Number(process.env.WECOM_KF_REPLY_JUDGE_TIMEOUT_MS || 20000);
+const fastMode = process.env.WECOM_KF_FAST_MODE !== "0";
 const identityFollowupDelayMs = Number(process.env.WECOM_KF_IDENTITY_FOLLOWUP_DELAY_MS || 60000);
 const asyncAssessmentMode = process.env.WECOM_KF_ASYNC_ASSESSMENT_MODE !== "0";
 const asyncAssessmentTimeoutMs = Number(process.env.WECOM_KF_ASYNC_ASSESSMENT_TIMEOUT_MS || 90000);
@@ -82,7 +83,7 @@ server.listen(port, "127.0.0.1", () => {
   log(`[wecom-kf] job overview file: ${jobOverviewPath}`);
   log(`[wecom-kf] job guide dir: ${jobGuidesDir} (${jobGuides.length} guide(s))`);
   log(
-    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMinMs}-${replyPartDelayMaxMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; reply judge: ${replyJudgeEnabled ? "on" : "off"}; reply judge timeout: ${replyJudgeTimeoutMs}ms; strict guide questions: on; identity followup delay: ${identityFollowupDelayMs}ms; async assessment: ${asyncAssessmentMode ? "on" : "off"}; async assessment timeout: ${asyncAssessmentTimeoutMs}ms; async assessment quiet: ${asyncAssessmentQuietMs}ms`,
+    `[wecom-kf] intake delay: ${intakeDelayMs}ms; reply part delay: ${replyPartDelayMinMs}-${replyPartDelayMaxMs}ms; pre-send recheck max: ${preSendRecheckMax}; OpenClaw timeout: ${openClawTimeoutMs}ms; reply judge: ${replyJudgeEnabled ? "on" : "off"}; reply judge timeout: ${replyJudgeTimeoutMs}ms; fast mode: ${fastMode ? "on" : "off"}; identity followup delay: ${identityFollowupDelayMs}ms; async assessment: ${asyncAssessmentMode ? "on" : "off"}; async assessment timeout: ${asyncAssessmentTimeoutMs}ms; async assessment quiet: ${asyncAssessmentQuietMs}ms`,
   );
 });
 
@@ -434,12 +435,12 @@ function hasHrAskedExact(history, reply) {
 }
 
 async function runInterviewTurn({ externalUserId, text }) {
-  const strictGuideResult = await buildStrictGuideInterviewTurn({ externalUserId, text });
+  const strictGuideResult = await buildStrictGuideInterviewTurn({ externalUserId, text, fastMode });
   if (strictGuideResult) return strictGuideResult;
   return runOpenClaw({ externalUserId, text });
 }
 
-async function buildStrictGuideInterviewTurn({ externalUserId, text }) {
+async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode }) {
   const safeExternalUserId = safeId(externalUserId);
   const history = loadCandidateHistory(safeExternalUserId);
   const candidateRecord = loadCandidateRecord(safeExternalUserId);
@@ -499,41 +500,19 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text }) {
     };
   }
 
-  const lastQuestion = findLastHrQuestion(history);
-  if (lastQuestion) {
-    const answerDecision = await judgeCandidateAnswerSufficiency({
-      recentHistory,
-      currentQuestion: lastQuestion,
-      candidateMessage: text,
-      nextQuestion: question,
-      matchedJobGuide,
-    });
-    if (answerDecision.action === "followup" && answerDecision.reply) {
-      log("[wecom-kf] strict guide interview followup from answer judge");
-      return {
-        reply: answerDecision.reply,
-        actions: {},
-        candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
-      };
-    }
-    if (answerDecision.action === "wait") {
-      log("[wecom-kf] strict guide interview answer judge chose no reply");
-      return {
-        reply: "NO_REPLY",
-        actions: {},
-        candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
-      };
-    }
+  if (fastMode) {
+    log(
+      `[wecom-kf] fast mode strict guide question from ${matchedJobGuide.fileName} (${fastQuestionCount + 1})`,
+    );
+    return {
+      reply: question,
+      actions: {},
+      candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
+    };
   }
 
-  log(
-    `[wecom-kf] strict guide question from ${matchedJobGuide.fileName} (${fastQuestionCount + 1})`,
-  );
-  return {
-    reply: question,
-    actions: {},
-    candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
-  };
+  log("[wecom-kf] fast mode off; using OpenClaw normal interview mode");
+  return null;
 }
 
 function buildFastCandidateUpdate({ matchedJobGuide }) {
