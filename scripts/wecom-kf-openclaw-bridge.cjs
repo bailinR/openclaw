@@ -435,12 +435,14 @@ function hasHrAskedExact(history, reply) {
 }
 
 async function runInterviewTurn({ externalUserId, text }) {
-  const fastResult = fastInterviewMode ? buildFastInterviewTurn({ externalUserId, text }) : null;
+  const fastResult = fastInterviewMode
+    ? await buildFastInterviewTurn({ externalUserId, text })
+    : null;
   if (fastResult) return fastResult;
   return runOpenClaw({ externalUserId, text });
 }
 
-function buildFastInterviewTurn({ externalUserId, text }) {
+async function buildFastInterviewTurn({ externalUserId, text }) {
   const safeExternalUserId = safeId(externalUserId);
   const history = loadCandidateHistory(safeExternalUserId);
   const candidateRecord = loadCandidateRecord(safeExternalUserId);
@@ -504,6 +506,33 @@ function buildFastInterviewTurn({ externalUserId, text }) {
       actions: {},
       candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
     };
+  }
+
+  const lastQuestion = findLastHrQuestion(history);
+  if (lastQuestion) {
+    const answerDecision = await judgeCandidateAnswerSufficiency({
+      recentHistory,
+      currentQuestion: lastQuestion,
+      candidateMessage: text,
+      nextQuestion: question,
+      matchedJobGuide,
+    });
+    if (answerDecision.action === "followup" && answerDecision.reply) {
+      log("[wecom-kf] fast interview followup from answer judge");
+      return {
+        reply: answerDecision.reply,
+        actions: {},
+        candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
+      };
+    }
+    if (answerDecision.action === "wait") {
+      log("[wecom-kf] fast interview answer judge chose no reply");
+      return {
+        reply: "NO_REPLY",
+        actions: {},
+        candidateUpdate: buildFastCandidateUpdate({ matchedJobGuide }),
+      };
+    }
   }
 
   log(
@@ -633,6 +662,128 @@ function hasLikelyCandidateNameInHistory(history, matchedJobGuide) {
   return history.some(
     (item) => item.role !== "HR" && hasLikelyCandidateNameInText(item.text, matchedJobGuide),
   );
+}
+
+function findLastHrQuestion(history) {
+  return (
+    [...history]
+      .reverse()
+      .find((item) => item.role === "HR" && looksLikeQuestionForCandidate(item.text))?.text || ""
+  );
+}
+
+function looksLikeQuestionForCandidate(text) {
+  const value = String(text || "").trim();
+  if (!value || value === "好的") return false;
+  if (normalizeQuestionText(value).includes(normalizeQuestionText(openingIntroMessage())))
+    return false;
+  return (
+    /[？?]/u.test(value) ||
+    /(说下|介绍|了解|方便|是否|有没有|哪里|多少|多久|什么|怎么|哪)/u.test(value)
+  );
+}
+
+async function judgeCandidateAnswerSufficiency({
+  recentHistory,
+  currentQuestion,
+  candidateMessage,
+  nextQuestion,
+  matchedJobGuide,
+}) {
+  if (!currentQuestion || !candidateMessage) return { action: "answered", reply: "", reason: "" };
+
+  const messagePath = path.join(
+    stateDir,
+    `answer-judge-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.txt`,
+  );
+  const prompt = [
+    "你是企业微信招聘面试的回答充分性判断器。",
+    "你只判断候选人对 current_question 的回答是否足够，以及是否需要追问。",
+    "必须只输出合法 JSON，不要 Markdown，不要额外文字。",
+    "",
+    "判断原则：",
+    "1. 如果候选人的回答已经能满足问题的核心信息，action=answered，即使回答很短也可以。例如问居住地/地铁站，回答“黄村”可视为已回答，不要为了确认区域还是地铁站继续追问。",
+    "2. 如果 current_question 是复合问题，只追问缺失且重要的部分。例如问已婚未婚、有没有小孩，候选人只回答“已婚”，需要追问有没有小孩。",
+    "3. 如果候选人明确拒绝或表示问题无关，通常 action=answered，除非该信息对岗位流程非常关键。",
+    "4. followup 只能问一个核心问题，不要总结、不要说记下了、不要复述候选人回答。",
+    "5. 如果回答答非所问且需要候选人补充，action=followup。",
+    "",
+    "JSON 输出格式：",
+    JSON.stringify(
+      {
+        action: "answered | followup | wait",
+        reply: "action=followup 时填写要发给候选人的追问，否则空字符串",
+        reason: "简短说明，内部日志用，不发给候选人",
+      },
+      null,
+      2,
+    ),
+    "",
+    "recent_history:",
+    recentHistory || "暂无",
+    "",
+    "current_question:",
+    currentQuestion,
+    "",
+    "candidate_message:",
+    candidateMessage,
+    "",
+    "next_question_if_answered:",
+    nextQuestion || "",
+    "",
+    "matched_job_file:",
+    matchedJobGuide ? `${matchedJobGuide.fileName}\n${matchedJobGuide.content}` : "未匹配",
+  ].join("\n");
+
+  fs.writeFileSync(messagePath, prompt, "utf8");
+
+  const args = [
+    "scripts/run-node.mjs",
+    "--dev",
+    "agent",
+    "--agent",
+    agentId,
+    "--local",
+    "--session-key",
+    `agent:${agentId}:wecom-kf-answer-judge`,
+    "--message-file",
+    messagePath,
+    "--json",
+    "--timeout",
+    String(Math.ceil(replyJudgeTimeoutMs / 1000)),
+  ];
+
+  try {
+    const output = await execFile(process.execPath, args, {
+      cwd: rootDir,
+      env: process.env,
+      timeout: replyJudgeTimeoutMs,
+    });
+    return normalizeAnswerJudgeDecision(extractAgentJsonText(output));
+  } catch (err) {
+    log(`[wecom-kf] answer judge failed; continuing to next question: ${err.message || err}`);
+    return { action: "answered", reply: "", reason: "judge failed" };
+  } finally {
+    try {
+      fs.unlinkSync(messagePath);
+    } catch {}
+  }
+}
+
+function normalizeAnswerJudgeDecision(rawText) {
+  const parsed =
+    tryParseJsonObject(stripMarkdownJsonFence(rawText)) ||
+    tryParseJsonObject(extractJsonObject(rawText)) ||
+    {};
+  const action = String(parsed.action || "").toLowerCase();
+  if (action === "followup") {
+    const reply = String(parsed.reply || "").trim();
+    return reply
+      ? { action: "followup", reply, reason: String(parsed.reason || "") }
+      : { action: "answered", reply: "", reason: String(parsed.reason || "") };
+  }
+  if (action === "wait") return { action: "wait", reply: "", reason: String(parsed.reason || "") };
+  return { action: "answered", reply: "", reason: String(parsed.reason || "") };
 }
 
 async function runOpenClaw({ externalUserId, text }) {
@@ -1468,6 +1619,7 @@ function shouldReviewRepeatedQuestion(question, recentHistory, text) {
   if (!value) return false;
   const combined = [recentHistory, text].filter(Boolean).join("\n");
   const normalizedCombined = normalizeQuestionText(combined);
+  if (asksQuestion(value) && resemblesRecentHrQuestion(value, recentHistory)) return true;
   if (hasMultipleQuestionMarks(value)) return true;
   if (replyAsksChildDetails(value) && indicatesNoChildren({ recentHistory, text })) return true;
   if (replyAsksFamilyPersonal(value) && indicatesFamilyPushback({ recentHistory, text }))
@@ -1586,6 +1738,30 @@ function hasMultipleQuestionMarks(value) {
   return Boolean(matches && matches.length >= 2);
 }
 
+function asksQuestion(value) {
+  return (
+    /[？?]/u.test(value) ||
+    /(说下|介绍|了解|方便|是否|有没有|哪里|多少|多久|什么|怎么|哪)/u.test(String(value || ""))
+  );
+}
+
+function resemblesRecentHrQuestion(question, recentHistory) {
+  const normalizedQuestion = normalizeQuestionText(question);
+  if (!normalizedQuestion) return false;
+  return String(recentHistory || "")
+    .split(/\r\n|\n|\r/u)
+    .reverse()
+    .slice(0, 12)
+    .some((line) => {
+      if (!line.startsWith("HR：")) return false;
+      const normalizedLine = normalizeQuestionText(line.replace(/^HR：/u, ""));
+      if (!normalizedLine) return false;
+      const questionProbe = normalizedQuestion.slice(0, Math.min(12, normalizedQuestion.length));
+      const lineProbe = normalizedLine.slice(0, Math.min(12, normalizedLine.length));
+      return normalizedLine.includes(questionProbe) || normalizedQuestion.includes(lineProbe);
+    });
+}
+
 function replyAsksChildDetails(value) {
   return (
     /(小孩|孩子|娃|宝宝)/u.test(value) && /(几个|几岁|多大|谁带|情况|有没有|有几个)/u.test(value)
@@ -1661,6 +1837,7 @@ function countAskedGuideQuestions(content, historyText) {
 function isGuideQuestionCoveredByHistory(question, normalizedHistory) {
   return (
     isExactGuideQuestionInHistory(question, normalizedHistory) ||
+    isLocationQuestionCoveredByHistory(question, normalizedHistory) ||
     isFamilyQuestionCoveredByHistory(question, normalizedHistory)
   );
 }
@@ -1669,7 +1846,21 @@ function isExactGuideQuestionInHistory(question, normalizedHistory) {
   const normalizedQuestion = normalizeQuestionText(question);
   if (!normalizedQuestion) return false;
   const probe = normalizedQuestion.slice(0, Math.min(12, normalizedQuestion.length));
-  return normalizedHistory.includes(probe);
+  if (normalizedHistory.includes(probe)) return true;
+
+  const relaxedQuestion = relaxQuestionText(normalizedQuestion);
+  const relaxedHistory = relaxQuestionText(normalizedHistory);
+  const relaxedProbe = relaxedQuestion.slice(0, Math.min(12, relaxedQuestion.length));
+  return Boolean(relaxedProbe && relaxedHistory.includes(relaxedProbe));
+}
+
+function relaxQuestionText(value) {
+  return String(value || "").replace(/那|方便|说下|说一下|了解下|了解一下|及|和|与/g, "");
+}
+
+function isLocationQuestionCoveredByHistory(question, normalizedHistory) {
+  if (!/(住在哪里|居住|地铁站|住哪|在哪住)/u.test(question)) return false;
+  return /(住在哪里|居住|地铁站|住哪|在哪住)/u.test(normalizedHistory);
 }
 
 function isFamilyQuestionCoveredByHistory(question, normalizedHistory) {
