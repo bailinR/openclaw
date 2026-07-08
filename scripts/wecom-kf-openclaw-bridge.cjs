@@ -530,6 +530,11 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode })
   }
 
   if (fastMode) {
+    const route = classifyCandidateReplyForFastMode({ history, text });
+    if (route.mode !== "fast") {
+      log(`[wecom-kf] fast mode routed to OpenClaw normal mode: ${route.reason}`);
+      return null;
+    }
     log(
       `[wecom-kf] fast mode strict guide question from ${matchedJobGuide.fileName} (${fastQuestionCount + 1})`,
     );
@@ -620,6 +625,67 @@ function positionFromGuideFile(fileName) {
   if (fileName === "sales.md") return "销售岗";
   if (fileName === "project-planning.md") return "项目策划岗";
   return fileName.replace(/\.md$/iu, "");
+}
+
+function classifyCandidateReplyForFastMode({ history, text }) {
+  const value = String(text || "").trim();
+  const normalized = normalizeQuestionText(value);
+  if (!normalized) return { mode: "normal", reason: "empty candidate reply" };
+
+  if (looksLikeCandidatePushback(value)) {
+    return { mode: "normal", reason: "candidate pushback or emotion" };
+  }
+  if (looksLikeCandidateQuestion(value)) {
+    return { mode: "normal", reason: "candidate question" };
+  }
+  if (looksLikeCandidateRefusal(value)) {
+    return { mode: "normal", reason: "candidate refusal or unavailable answer" };
+  }
+
+  const lastQuestion = findLastHrQuestion(history);
+  if (lastQuestion && looksClearlyUnanswered({ question: lastQuestion, answer: value })) {
+    return { mode: "normal", reason: "candidate answer appears incomplete" };
+  }
+
+  return { mode: "fast", reason: "normal candidate answer" };
+}
+
+function looksLikeCandidateQuestion(text) {
+  const value = String(text || "");
+  return (
+    /[？?]/u.test(value) ||
+    /(为什么|为啥|怎么|什么意思|啥意思|可以吗|靠谱吗|真实吗|确定吗|哪里|哪个|多少|多久)/u.test(
+      value,
+    )
+  );
+}
+
+function looksLikeCandidatePushback(text) {
+  return /(不想|不愿|不方便|隐私|和岗位无关|跟岗位无关|有必要吗|必须|为什么问|别问|烦|离谱|奇怪|质疑|不理解)/u.test(
+    String(text || ""),
+  );
+}
+
+function looksLikeCandidateRefusal(text) {
+  const normalized = normalizeQuestionText(text);
+  return /^(不知道|不清楚|忘了|没有|没了|无|暂时没有|不记得|说不清)$/u.test(normalized);
+}
+
+function looksClearlyUnanswered({ question, answer }) {
+  const normalizedAnswer = normalizeQuestionText(answer);
+  if (!normalizedAnswer) return true;
+
+  if (/(薪资|底薪|提成|客单价|业绩|任务|回款|占比|多少|几个|几家|几分|多久|多大)/u.test(question)) {
+    return !/[\d一二三四五六七八九十百千万kK万%％]/u.test(answer);
+  }
+
+  if (/(有没有小孩|有没小孩|是否已结婚|婚育|家庭情况)/u.test(question)) {
+    return !/(已婚|未婚|离异|有小孩|没有小孩|没小孩|无小孩|有孩子|没孩子|没有孩子|无孩子)/u.test(
+      answer,
+    );
+  }
+
+  return false;
 }
 
 function shouldFastAskIdentityAndPosition({ candidateRecord, history, text }) {
