@@ -38,6 +38,9 @@ const identityFollowupDelayMs = Number(process.env.WECOM_KF_IDENTITY_FOLLOWUP_DE
 const asyncAssessmentMode = process.env.WECOM_KF_ASYNC_ASSESSMENT_MODE !== "0";
 const asyncAssessmentTimeoutMs = Number(process.env.WECOM_KF_ASYNC_ASSESSMENT_TIMEOUT_MS || 90000);
 const asyncAssessmentQuietMs = Number(process.env.WECOM_KF_ASYNC_ASSESSMENT_QUIET_MS || 5000);
+const interviewCompleteMessage =
+  process.env.WECOM_KF_INTERVIEW_COMPLETE_MESSAGE ||
+  "感谢您的配合，后续我们会进行一个综合评估，如果进入复试，有消息会第一时间联系您。";
 const jobGuidesDir =
   process.env.WECOM_KF_JOB_GUIDES_DIR || path.join(rootDir, "scripts", "wecom-kf-job-guides");
 const globalPromptPath =
@@ -479,7 +482,17 @@ async function buildStrictGuideInterviewTurn({ externalUserId, text, fastMode })
   const fastQuestionCount = askedGuideQuestions.length;
 
   const question = pickNextGuideQuestion(matchedJobGuide.content, historyText, askedGuideQuestions);
-  if (!question) return null;
+  if (!question) {
+    if (hasCompletedGuide(candidateRecord, matchedJobGuide.fileName)) {
+      return { reply: "NO_REPLY", actions: {}, candidateUpdate: null };
+    }
+    log(`[wecom-kf] strict guide interview completed for ${matchedJobGuide.fileName}`);
+    return {
+      reply: interviewCompleteMessage,
+      actions: {},
+      candidateUpdate: buildGuideCompleteCandidateUpdate({ matchedJobGuide }),
+    };
+  }
 
   if (!hasSentOpeningIntro(history) && !identityStatus.complete) {
     log("[wecom-kf] strict guide interview waiting before identity followup");
@@ -527,6 +540,20 @@ function buildFastCandidateUpdate({ matchedJobGuide, askedQuestion }) {
     };
   }
   return update;
+}
+
+function buildGuideCompleteCandidateUpdate({ matchedJobGuide }) {
+  return {
+    position: positionFromGuideFile(matchedJobGuide.fileName),
+    stage: "初筛已完成",
+    guide_completed: {
+      [matchedJobGuide.fileName]: true,
+    },
+  };
+}
+
+function hasCompletedGuide(candidateRecord, guideFileName) {
+  return Boolean(candidateRecord?.guide_completed?.[guideFileName]);
 }
 
 function positionFromGuideFile(fileName) {
