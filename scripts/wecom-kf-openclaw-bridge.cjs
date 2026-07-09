@@ -1066,7 +1066,7 @@ function buildReplyPrompt({ candidateRecord, matchedJobGuide, recentHistory, tex
     "你是企业微信招聘客服 bridge 的内部响应生成器。",
     "必须只输出一个合法 JSON 对象，不要使用 Markdown 代码块，不要输出 JSON 以外的文字。",
     "本轮只负责生成要发给求职者的微信回复，不要整理资料、不要评分、不要输出 candidate_update。",
-    "reply 字段只能放候选人可见的微信正文，不得包含 JSON、candidate_update、assessment、score、评分、加分、减分、总分、等级等内部字段或明细。",
+    "reply 字段只能放候选人可见的微信正文，不得包含 JSON、candidate_update、assessment、score、评分、加分、总分、等级等内部字段或明细。",
     "",
     "JSON 输出格式：",
     JSON.stringify(
@@ -1114,7 +1114,7 @@ function buildReplyPrompt({ candidateRecord, matchedJobGuide, recentHistory, tex
     "4.2 候选人回答有效且不需要追问时，直接进入岗位文件里的下一个问题。",
     "4.3 只有候选人回答含糊、缺关键数字或明显答非所问时，才围绕当前问题追问；追问也不要先总结。",
     "5. 不要发送系统报错、日志、调试信息或内部失败原因。",
-    "6. 候选人资料、评分、加减分明细是内部信息，绝不能写进 reply。本轮不要输出 candidate_update，后台会单独整理评分。",
+    "6. 候选人资料、评分明细是内部信息，绝不能写进 reply。本轮不要输出 candidate_update，后台会单独整理评分。",
     "7. 只决定当前应该如何回复求职者；资料沉淀、评分、总结交给后台任务处理。",
     "8. 如果需要发送项目策划测试题 PDF，只能通过 actions.send_project_planning_test_pdf=true 触发；reply 里不要写服务器文件路径或内部动作名。",
     "",
@@ -1302,11 +1302,19 @@ function buildAssessmentPrompt({ candidateRecord, matchedJobGuide, recentHistory
     "整理要求：",
     "1. 只根据已知对话和已积累资料更新 candidate_update，不要编造信息。",
     "2. 不知道的字段填 null 或空数组；已有资料中明确的信息不要因为本轮未提到而清空。",
-    "3. 根据候选人应聘岗位和岗位评分标准持续更新评分、加减分和内部简评。",
+    "3. 根据候选人应聘岗位和岗位评分标准持续更新评分、加分和负面总结提醒。",
     "4. 如果岗位文件中的某个问题已经由通用开场问题覆盖，例如哪里人、住哪里、最近薪资、期望薪资，就直接基于回答评分，不要认为缺失。",
     "5. candidate_questions 只记录候选人主动问过、需要面试官解答的问题。",
     "6. next_missing_info 只能放具体岗位文档“题目：”中的原始问题原文；不要放字段名、概括版问题、润色后的客服话术或自行扩展的问题。",
     "7. 如果岗位原题发送时需要拆成多条或改得更口语，由微信回复任务处理；candidate_update 里必须保留岗位文档原题。",
+    "",
+    "评分校准规则：",
+    "1. 岗位文件里的区间分不是保守默认值。候选人已明确符合高分档关键条件，且没有明确负向证据时，优先给该区间上限或接近上限，不要默认取中位数或低位数。",
+    "2. 未问到、未知或候选人未主动展开的信息，只能记为未知；不能因为未知就自动按低分处理。只有出现明确负向证据，才降低到对应低分档。",
+    "3. 复合题里候选人已经回答了影响评分的核心点时，应先按已知正向信息打分；剩余细节可记录在 known_info 或 next_missing_info，不要把“还没问完”直接当作扣低分理由。",
+    "4. 评分依据要写清楚“为什么给这个分”，避免只写“可达某区间”。如果依据已经满足高分档，应直接给高分档分数。",
+    "5. 销售岗校准样例：老家湖北、住黄村且近地铁、未婚，没有通勤过长或婚姻不和证据时，基本情况匹配度按 5 分处理。",
+    "6. 销售岗校准样例：离职原因是个人发展，看重新公司发展前景，能接受加班，没有被辞退、强制解除、频繁跳槽或抗拒加班证据时，职业稳定性按 5 分处理。",
     "",
     "具体岗位文档：",
     matchedJobGuide
@@ -1360,9 +1368,8 @@ function buildCandidateUpdateTemplate() {
     assessment: {
       score: "0-100 的数字；信息不足时也要基于已知信息给暂定分",
       level: "信息不足/需谨慎/基本匹配/较匹配/优秀",
-      plus: [{ item: "加分项", points: 0, evidence: "依据" }],
-      minus: [{ item: "减分项", points: 0, evidence: "依据" }],
-      summary: "给招聘负责人看的内部简评，不要写给候选人",
+      plus: [{ item: "岗位评分维度或加分项", points: 0, evidence: "依据" }],
+      summary: "给招聘负责人看的内部简评，可包含风险点或负面提醒，不要写给候选人",
     },
   };
 }
@@ -1626,7 +1633,7 @@ function looksLikeJsonObject(text) {
 }
 
 function looksLikeInternalLeak(text) {
-  return /candidate_update|candidateUpdate|candidate_record|candidateRecord|assessment|score|评分|加分|减分|总分|等级|内部简评|内部资料/i.test(
+  return /candidate_update|candidateUpdate|candidate_record|candidateRecord|assessment|score|评分|加分|总分|等级|内部简评|内部资料/i.test(
     String(text || ""),
   );
 }

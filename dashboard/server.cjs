@@ -355,7 +355,7 @@ function renderPage() {
     .layout {
       height: calc(100vh - 72px);
       display: grid;
-      grid-template-columns: minmax(300px, 380px) minmax(430px, 1fr) minmax(400px, 540px);
+      grid-template-columns: minmax(340px, 460px) minmax(430px, 1fr) minmax(380px, 520px);
       min-height: 520px;
     }
     aside, main, section {
@@ -420,8 +420,8 @@ function renderPage() {
       border: 1px solid transparent;
       background: transparent;
       border-radius: 6px;
-      padding: 11px;
-      margin-bottom: 4px;
+      padding: 12px;
+      margin-bottom: 6px;
     }
     .candidate:hover {
       background: #f8fafc;
@@ -433,29 +433,29 @@ function renderPage() {
     }
     .candidate-name {
       display: flex;
-      align-items: center;
-      justify-content: space-between;
+      align-items: flex-start;
+      justify-content: flex-start;
+      flex-wrap: wrap;
       gap: 8px;
       font-weight: 650;
     }
     .candidate-name-text {
       min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      overflow-wrap: anywhere;
+      line-height: 1.35;
     }
     .badge {
       display: inline-flex;
       align-items: center;
-      max-width: 120px;
+      max-width: 100%;
       border-radius: 999px;
       padding: 2px 8px;
       font-size: 12px;
+      line-height: 1.35;
       color: #0f5f59;
       background: var(--accent-soft);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      white-space: normal;
+      overflow-wrap: anywhere;
     }
     .candidate-meta, .candidate-last, .muted {
       color: var(--muted);
@@ -465,6 +465,7 @@ function renderPage() {
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-wrap: wrap;
       gap: 8px;
       margin-top: 5px;
     }
@@ -483,9 +484,8 @@ function renderPage() {
       color: #475569;
       font-size: 11px;
       line-height: 1.35;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      white-space: normal;
+      overflow-wrap: anywhere;
     }
     .mini-pill.warn {
       color: var(--warning);
@@ -493,11 +493,9 @@ function renderPage() {
     }
     .candidate-last {
       margin-top: 6px;
-      overflow: hidden;
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
       line-height: 1.45;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
     }
     main {
       display: flex;
