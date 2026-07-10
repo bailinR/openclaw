@@ -17,4 +17,4 @@
 
 基础信息收集完成并适合进入测试题环节时，才设置 `actions.send_project_planning_test_pdf=true`。reply 里不要写服务器文件路径或内部动作名。
 
-评分只写入 `candidate_update.assessment`，不要把评分、加分、减分、等级或内部判断发给候选人。
+评分只写入 `candidate_update.assessment`，不要把评分、加分、等级或内部判断发给候选人。
